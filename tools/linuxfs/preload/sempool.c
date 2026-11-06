@@ -285,13 +285,7 @@ static ssize_t sp_send(int fd, const struct iovec *iov, int n) {
   const unsigned char *req = iov[0].iov_base;
   int code = (int)sp_u32(req);
   if (sp_rfd >= 0 ? fd != sp_wfd : !sp_channel(fd)) {
-    /* Not a server call, so ntdll has not blocked signals: a handler's server call would wait on
-     * sp_lock held by this thread. */
-    sigset_t all, old;
-    sigfillset(&all);
-    pthread_sigmask(SIG_BLOCK, &all, &old);
     sp_scan(iov, n, 0);
-    pthread_sigmask(SIG_SETMASK, &old, NULL);
     return -2;
   }
   if (sp_rfd < 0 && sp_request_shape(iov, n)) {
@@ -326,6 +320,19 @@ static ssize_t sp_send(int fd, const struct iovec *iov, int n) {
   return -2;
 }
 
+/* ntdll blocks signals around its server calls but not around other writes, and a handler's own
+ * server call would wait on sp_lock held by the interrupted thread. */
+static ssize_t sp_send_masked(int fd, const struct iovec *iov, int n) {
+  sigset_t all, old;
+  sigfillset(&all);
+  pthread_sigmask(SIG_BLOCK, &all, &old);
+  ssize_t r = sp_send(fd, iov, n);
+  int saved = errno;
+  pthread_sigmask(SIG_SETMASK, &old, NULL);
+  errno = saved;
+  return r;
+}
+
 static void sp_resolve(void) {
   if (!__atomic_load_n(&sp_real_read, __ATOMIC_ACQUIRE))
     __atomic_store_n(&sp_real_read, (ssize_t (*)(int, void *, size_t))dlsym(RTLD_NEXT, "read"), __ATOMIC_RELEASE);
@@ -340,7 +347,7 @@ ssize_t write(int fd, const void *buf, size_t count) {
   if (__builtin_expect(!__atomic_load_n(&sp_real_write, __ATOMIC_ACQUIRE), 0)) sp_resolve();
   if (count == SP_MSG && sp_on() && bl_from_ntdll(__builtin_return_address(0))) {
     struct iovec one = { (void *)buf, count };
-    ssize_t r = sp_send(fd, &one, 1);
+    ssize_t r = sp_send_masked(fd, &one, 1);
     if (r != -2) return r;
     r = sp_real_write(fd, buf, count);
     if (r != (ssize_t)count) {
@@ -355,7 +362,7 @@ ssize_t write(int fd, const void *buf, size_t count) {
 ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
   if (__builtin_expect(!__atomic_load_n(&sp_real_writev, __ATOMIC_ACQUIRE), 0)) sp_resolve();
   if (iovcnt > 0 && iov[0].iov_len == SP_MSG && sp_on() && bl_from_ntdll(__builtin_return_address(0))) {
-    ssize_t r = sp_send(fd, iov, iovcnt);
+    ssize_t r = sp_send_masked(fd, iov, iovcnt);
     if (r != -2) return r;
     size_t total = 0;
     for (int i = 0; i < iovcnt; i++) total += iov[i].iov_len;
@@ -387,7 +394,11 @@ ssize_t read(int fd, void *buf, size_t count) {
         sp_channel(fd)) {
       sp_wfd = sp_capture_fd;
       sp_rfd = fd;
+      sigset_t all, old;
+      sigfillset(&all);
+      pthread_sigmask(SIG_BLOCK, &all, &old);
       sp_track(sp_u32((unsigned char *)buf + 8), &key);
+      pthread_sigmask(SIG_SETMASK, &old, NULL);
     }
     return r;
   }
