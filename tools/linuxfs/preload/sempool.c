@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -15,7 +16,9 @@
  * A pooled handle is open on the server but closed for the program, so a request naming one may be
  * a use after close: the handle then waits in sp_zombie until a thread whose request and reply fds
  * are known closes it for real, before its own request reaches the server. Replies are only forged
- * on those fds, learnt from a request whose well-formed reply came back on another fd. */
+ * on those fds, learnt from a request whose well-formed reply came back on another fd; both must be
+ * pipes or sockets. A thread's first request goes out before its fds are known, so a use after close
+ * in it still reaches the server with the handle open. */
 
 int bl_from_ntdll(const void *caller) __attribute__((visibility("hidden")));
 
@@ -264,13 +267,18 @@ static int sp_request_shape(const struct iovec *iov, int n) {
   const unsigned char *req = iov[0].iov_base;
   size_t data = 0;
   for (int i = 1; i < n; i++) data += iov[i].iov_len;
-  return sp_u32(req) < 4096 && sp_u32(req + 4) == data && sp_u32(req + 8) <= (1u << 26);
+  return sp_u32(req) < 4096 && (sp_u32(req) || data) && sp_u32(req + 4) == data && sp_u32(req + 8) <= (1u << 26);
+}
+
+static int sp_channel(int fd) {
+  struct stat st;
+  return fstat(fd, &st) == 0 && (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode));
 }
 
 static ssize_t sp_send(int fd, const struct iovec *iov, int n) {
   const unsigned char *req = iov[0].iov_base;
   int code = (int)sp_u32(req);
-  if (sp_rfd >= 0 && fd != sp_wfd) {
+  if (sp_rfd >= 0 ? fd != sp_wfd : !sp_channel(fd)) {
     sp_scan(iov, n, 0);
     return -2;
   }
@@ -322,6 +330,12 @@ ssize_t write(int fd, const void *buf, size_t count) {
     struct iovec one = { (void *)buf, count };
     ssize_t r = sp_send(fd, &one, 1);
     if (r != -2) return r;
+    r = sp_real_write(fd, buf, count);
+    if (r != (ssize_t)count) {
+      sp_pending = SP_IDLE;
+      sp_learn_fd = -1;
+    }
+    return r;
   }
   return sp_real_write(fd, buf, count);
 }
@@ -334,7 +348,10 @@ ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
     size_t total = 0;
     for (int i = 0; i < iovcnt; i++) total += iov[i].iov_len;
     r = sp_real_writev(fd, iov, iovcnt);
-    if (r != (ssize_t)total) sp_pending = SP_IDLE;
+    if (r != (ssize_t)total) {
+      sp_pending = SP_IDLE;
+      sp_learn_fd = -1;
+    }
     return r;
   }
   return sp_real_writev(fd, iov, iovcnt);
@@ -366,7 +383,7 @@ ssize_t read(int fd, void *buf, size_t count) {
     int wfd = sp_learn_fd;
     sp_learn_fd = -1;
     ssize_t r = sp_real_read(fd, buf, count);
-    if (r == SP_MSG && sp_u32((unsigned char *)buf + 4) <= sp_learn_max) {
+    if (r == SP_MSG && sp_u32((unsigned char *)buf + 4) <= sp_learn_max && sp_channel(fd)) {
       sp_wfd = wfd;
       sp_rfd = fd;
     }

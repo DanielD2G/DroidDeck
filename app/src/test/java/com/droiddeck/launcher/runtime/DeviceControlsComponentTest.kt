@@ -67,6 +67,18 @@ class DeviceControlsComponentTest {
         assertEquals(3, audio.getStreamVolume(AudioManager.STREAM_MUSIC))
     }
 
+    @Test fun aStateFileChangedInTheGuestIsRepaired() {
+        tick()
+        val state = File(directory, "state.json")
+        val volume = File(directory, "volume.state")
+        val published = state.readText()
+        state.delete()
+        volume.writeText("0 0 0\n")
+        reconcile()
+        assertEquals(published, state.readText())
+        assertNotEquals("0 0 0\n", volume.readText())
+    }
+
     @Test fun everyVolumeStepIsPublishedWithoutWaitingForThePoll() {
         for (level in 2..5) {
             audio.setStreamVolume(AudioManager.STREAM_MUSIC, level, 0)

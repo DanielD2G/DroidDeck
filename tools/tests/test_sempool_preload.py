@@ -55,6 +55,12 @@ ssize_t nt_write_file(int fd, const uint32_t *words) {
   __asm__ volatile("" ::: "memory");
   return r;
 }
+
+ssize_t nt_read_file(int fd, uint32_t *words) {
+  ssize_t r = read(fd, words, 64);
+  __asm__ volatile("" ::: "memory");
+  return r;
+}
 """
 
 PROGRAM = r"""
@@ -63,11 +69,13 @@ PROGRAM = r"""
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdlib.h>
 
 uint32_t nt_create_semaphore(int, int, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *);
 uint32_t nt_close(int, int, uint32_t);
 uint32_t nt_other(int, int, uint32_t, uint32_t);
 ssize_t nt_write_file(int, const uint32_t *);
+ssize_t nt_read_file(int, uint32_t *);
 
 static int q[2], a[2];
 static int creates, closes, others;
@@ -101,6 +109,16 @@ int main(int argc, char **argv) {
   pthread_create(&t, NULL, server, NULL);
   const char *mode = argv[1];
   uint32_t first = 0, last = 0, distinct = 0;
+  if (!strcmp(mode, "files-then-loop")) {
+    char out[] = "/tmp/sempool-out-XXXXXX", in[] = "/tmp/sempool-in-XXXXXX";
+    int fo = mkstemp(out), fi = mkstemp(in);
+    uint32_t zeros[16] = {0};
+    if (fo < 0 || fi < 0 || write(fi, zeros, sizeof zeros) != sizeof zeros || lseek(fi, 0, SEEK_SET)) return 5;
+    unlink(out);
+    unlink(in);
+    if (nt_write_file(fo, zeros) != 64 || nt_read_file(fi, zeros) != 64) return 6;
+    mode = "loop";
+  }
   if (!strcmp(mode, "loop")) {
     for (int i = 0; i < 1000; i++) {
       uint32_t h = create(0x7fffffff, 0);
@@ -207,6 +225,9 @@ class SemaphorePoolPreloadTest(unittest.TestCase):
 
     def test_create_close_loop_reaches_the_server_once(self):
         self.assertEqual(self.run_program("loop"), (1, 0, 0, 1))
+
+    def test_file_io_before_the_first_request_is_not_taken_for_the_server(self):
+        self.assertEqual(self.run_program("files-then-loop"), (1, 0, 0, 1))
 
     def test_missing_or_malformed_request_numbers_change_nothing(self):
         self.assertEqual(self.run_program("loop", protocol=None), (1000, 1000, 0, 1000))

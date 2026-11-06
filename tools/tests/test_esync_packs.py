@@ -647,7 +647,8 @@ class SelectTest(SyncTestCase):
         (root / "prefixes.json").write_text(json.dumps(rows))
         with mock.patch.dict(GLOBALS, {"server_running": lambda path: True}):
             self.assertEqual(self.select(tool, self.env())[1]["BL_SEMPOOL"], "40,21")
-            self.assertEqual(self.select(tool, self.env(BL_SEMPOOL="57,3"))[1]["BL_SEMPOOL"], "40,21")
+            for numbers in ("57,3", "+57, 3", " 57,+3"):
+                self.assertEqual(self.select(tool, self.env(BL_SEMPOOL=numbers))[1]["BL_SEMPOOL"], "40,21", numbers)
             command, env, said = self.select(tool, self.env(BL_SEMPOOL="0"))
         self.assertEqual(env["BL_SEMPOOL"], "0")
         self.assertIn("keeping its sync choice", said)

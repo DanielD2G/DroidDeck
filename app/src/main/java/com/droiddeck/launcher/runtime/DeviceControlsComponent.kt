@@ -31,6 +31,7 @@ class DeviceControlsComponent(context: Context, root: File, private val activity
     private var running = false
     private var permissionNotified = false
     private var previous = ""
+    private var published: String? = null
     private var revision = 0L
     private var ticks = 0
     private val written = HashMap<String, String>()
@@ -82,9 +83,10 @@ class DeviceControlsComponent(context: Context, root: File, private val activity
             val state = JSONObject().put("brightness", (value.coerceIn(1, 255) - 1) / 254.0)
                 .put("brightnessWritable", Settings.System.canWrite(context)).toString()
             if (force || state != previous) {
-                write("state.json", JSONObject(state).put("revision", ++revision).toString())
+                published = JSONObject(state).put("revision", ++revision).toString()
                 previous = state
             }
+            published?.let { write("state.json", it) }
         } catch (e: Exception) {
             Log.w(TAG, "Could not publish Android controls", e)
         }
