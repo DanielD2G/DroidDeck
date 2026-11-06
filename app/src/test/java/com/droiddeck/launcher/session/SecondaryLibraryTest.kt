@@ -111,6 +111,25 @@ class SecondaryLibraryTest {
         })
     }
 
+    @Test fun aToolCopiedOffTheCardIsExecutableOnceAndThenLeftAlone() {
+        val files = tmp.newFolder("files")
+        val library = tmp.newFolder("card")
+        val manifest = File(library, "steamapps/appmanifest_123.acf")
+        manifest.parentFile!!.mkdirs()
+        manifest.writeText("\"AppState\" { \"appid\" \"123\" \"installdir\" \"Proton 99.0 (ARM64)\" }")
+        val launcher = File(library, "steamapps/common/Proton 99.0 (ARM64)/proton")
+        launcher.parentFile!!.mkdirs()
+        launcher.writeText("#!/bin/sh\n")
+        launcher.setExecutable(false, false)
+        SecondaryLibrary.binds(files, library)
+        val copied = File(SecondaryLibrary.privateRoot(files, library), "steamapps/common/Proton 99.0 (ARM64)/proton")
+        assertTrue(copied.canExecute())
+        val data = File(copied.parentFile, "version")
+        data.writeText("1")
+        SecondaryLibrary.binds(files, library)
+        assertFalse(data.canExecute())
+    }
+
     @Test fun fexAndItsRuntimeInstallWhereTheirProgramsCanRun() {
         val files = tmp.newFolder("files")
         val library = tmp.newFolder("card")

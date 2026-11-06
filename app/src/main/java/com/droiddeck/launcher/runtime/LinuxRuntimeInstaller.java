@@ -9,7 +9,6 @@ import com.droiddeck.launcher.R;
 import com.droiddeck.launcher.session.SessionPrefs;
 import com.droiddeck.launcher.core.ArchivePaths;
 import com.droiddeck.launcher.core.Downloader;
-import com.droiddeck.launcher.core.Hashes;
 import com.droiddeck.launcher.core.FileUtils;
 
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
@@ -310,13 +309,6 @@ public final class LinuxRuntimeInstaller {
                 return false;
             }
 
-            if (listener != null) listener.onProgress(Step.VERIFYING, context.getString(R.string.rtinst_verifying), -1);
-            String actual = Hashes.sha256(archive);
-            if (!release.sha256.equalsIgnoreCase(actual)) {
-                Log.w(TAG, "checksum mismatch: wanted " + release.sha256 + ", got " + actual);
-                return false;
-            }
-
             File root = LinuxRuntime.rootDir(context);
             File staging = new File(root.getParentFile(), LinuxRuntime.DIR + ".new");
             File old = new File(root.getParentFile(), LinuxRuntime.DIR + ".old");
@@ -556,6 +548,7 @@ public final class LinuxRuntimeInstaller {
         try (InputStream in = new ZstdCompressorInputStream(
                 new BufferedInputStream(new FileInputStream(archive), 1 << 16));
              TarArchiveInputStream tar = new TarArchiveInputStream(in)) {
+            byte[] buffer = new byte[1 << 16];
             TarArchiveEntry entry;
             while ((entry = tar.getNextTarEntry()) != null) {
                 File file = ArchivePaths.inside(destination, entry.getName());
@@ -594,7 +587,6 @@ public final class LinuxRuntimeInstaller {
                     links.remove(file);
                     File part = partFile(file);
                     try (OutputStream out = new FileOutputStream(part)) {
-                        byte[] buffer = new byte[1 << 16];
                         int read;
                         while ((read = tar.read(buffer)) != -1) out.write(buffer, 0, read);
                     }

@@ -73,8 +73,7 @@ object SecondaryLibrary {
         for ((id, dir) in tools) {
             for (relative in listOf("steamapps/common/$dir", "steamapps/downloading/$id")) {
                 val target = File(private, relative)
-                migrate(File(library, relative), target)
-                target.walkTopDown().filter { it.isFile }.forEach { it.setExecutable(true, true) }
+                migrate(File(library, relative), target, executable = true)
                 overrides.add(target to relative)
                 val lower = relative.lowercase(Locale.ROOT)
                 if (lower != relative) overrides.add(target to lower)
@@ -85,7 +84,7 @@ object SecondaryLibrary {
         }
     }
 
-    private fun migrate(source: File, target: File) {
+    private fun migrate(source: File, target: File, executable: Boolean = false) {
         val migrated = File(target.parentFile, ".${target.name}.migrated")
         if (target.isDirectory) {
             if (!migrated.isFile) migrated.writeText(source.canonicalPath)
@@ -108,6 +107,9 @@ object SecondaryLibrary {
                     else Files.copy(path, destination, NOFOLLOW_LINKS, COPY_ATTRIBUTES)
                 }
             }
+            // FUSE discarded the executable bits. Steam restores the depot's exact modes on
+            // verification; its launchers must already be executable when importing it.
+            if (executable) stage.walkTopDown().filter { it.isFile }.forEach { it.setExecutable(true, true) }
             check(stage.renameTo(target)) { "cannot finish migration to $target" }
             migrated.writeText(source.canonicalPath)
         } catch (e: Exception) {

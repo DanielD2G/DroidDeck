@@ -200,9 +200,6 @@ object DesktopCatalog {
                     Downloader.downloadFile(entry.url, download, true, entry.sha256, cancelled, progress)
                 }
                 if (!ok || cancelled?.getAsBoolean() == true) return context.getString(R.string.user_apps_download_failed)
-                report.onProgress(LinuxRuntimeInstaller.Step.VERIFYING, context.getString(R.string.rtinst_verifying), -1)
-                val actual = Hashes.sha256(download)
-                if (!entry.sha256.equals(actual, ignoreCase = true)) return context.getString(R.string.deskpkg_checksum_mismatch)
             }
             if (cancelled?.getAsBoolean() == true) return context.getString(R.string.user_apps_download_failed)
             report.onProgress(context.getString(R.string.deskpkg_installing, entry.name), -1)
