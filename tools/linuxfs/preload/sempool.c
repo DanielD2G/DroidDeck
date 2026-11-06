@@ -2,6 +2,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -86,7 +87,12 @@ static int sp_on(void) {
   const char *e = getenv("BL_SEMPOOL");
   char *end = NULL;
   long create = e ? strtol(e, &end, 10) : -1, close = -1;
-  if (create >= 0 && end && *end == ',') close = strtol(end + 1, &end, 10);
+  if (end == e) create = -1;
+  if (create >= 0 && *end == ',') {
+    const char *second = end + 1;
+    close = strtol(second, &end, 10);
+    if (end == second) close = -1;
+  }
   s = create >= 0 && create < 4096 && close >= 0 && close < 4096 && create != close && *end == 0;
   if (s) {
     __atomic_store_n(&sp_create_req, (int)create, __ATOMIC_RELAXED);
@@ -181,7 +187,7 @@ static int sp_bury(int wfd, int rfd) {
       do done = sp_real_read(rfd, reply, sizeof reply); while (done < 0 && errno == EINTR);
       ok = sp_io(done);
     }
-    __atomic_store_n(&sp_nzombie, sp_nzombie - 1, __ATOMIC_RELEASE);
+    if (ok) __atomic_store_n(&sp_nzombie, sp_nzombie - 1, __ATOMIC_RELEASE);
   }
   sp_count();
   pthread_mutex_unlock(&sp_lock);
@@ -279,7 +285,13 @@ static ssize_t sp_send(int fd, const struct iovec *iov, int n) {
   const unsigned char *req = iov[0].iov_base;
   int code = (int)sp_u32(req);
   if (sp_rfd >= 0 ? fd != sp_wfd : !sp_channel(fd)) {
+    /* Not a server call, so ntdll has not blocked signals: a handler's server call would wait on
+     * sp_lock held by this thread. */
+    sigset_t all, old;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, &old);
     sp_scan(iov, n, 0);
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
     return -2;
   }
   if (sp_rfd < 0 && sp_request_shape(iov, n)) {
@@ -371,7 +383,8 @@ ssize_t read(int fd, void *buf, size_t count) {
     sp_learn_fd = -1;
     struct sp_key key = sp_capture;
     ssize_t r = sp_real_read(fd, buf, count);
-    if (r == SP_MSG && !sp_u32(buf) && !sp_u32((unsigned char *)buf + 4) && sp_u32((unsigned char *)buf + 8)) {
+    if (r == SP_MSG && !sp_u32(buf) && !sp_u32((unsigned char *)buf + 4) && sp_u32((unsigned char *)buf + 8) &&
+        sp_channel(fd)) {
       sp_wfd = sp_capture_fd;
       sp_rfd = fd;
       sp_track(sp_u32((unsigned char *)buf + 8), &key);

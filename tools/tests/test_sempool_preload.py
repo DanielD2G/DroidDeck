@@ -233,6 +233,8 @@ class SemaphorePoolPreloadTest(unittest.TestCase):
         self.assertEqual(self.run_program("loop", protocol=None), (1000, 1000, 0, 1000))
         self.assertEqual(self.run_program("loop", protocol="40"), (1000, 1000, 0, 1000))
         self.assertEqual(self.run_program("loop", protocol="40,21x"), (1000, 1000, 0, 1000))
+        self.assertEqual(self.run_program("loop", protocol="40,"), (1000, 1000, 0, 1000))
+        self.assertEqual(self.run_program("loop", protocol=",21"), (1000, 1000, 0, 1000))
 
     def test_a_semaphore_named_in_another_request_is_really_closed(self):
         self.assertEqual(self.run_program("used"), (2, 1, 1, 1))
