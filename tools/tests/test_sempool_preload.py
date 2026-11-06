@@ -49,6 +49,12 @@ uint32_t nt_other(int q, int a, uint32_t code, uint32_t handle) {
   uint32_t words[5] = { code, 0, 0, 7, handle };
   return call(q, a, words, 5, NULL, 0, NULL);
 }
+
+ssize_t nt_write_file(int fd, const uint32_t *words) {
+  ssize_t r = write(fd, words, 64);
+  __asm__ volatile("" ::: "memory");
+  return r;
+}
 """
 
 PROGRAM = r"""
@@ -61,6 +67,7 @@ PROGRAM = r"""
 uint32_t nt_create_semaphore(int, int, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *);
 uint32_t nt_close(int, int, uint32_t);
 uint32_t nt_other(int, int, uint32_t, uint32_t);
+ssize_t nt_write_file(int, const uint32_t *);
 
 static int q[2], a[2];
 static int creates, closes, others;
@@ -115,6 +122,20 @@ int main(int argc, char **argv) {
     nt_other(q[1], a[0], 99, h);
     uint32_t h2 = create(0x7fffffff, 0);
     distinct = h2 != h;
+  } else if (!strcmp(mode, "double-close")) {
+    uint32_t h = create(0x7fffffff, 0);
+    uint32_t first = nt_close(q[1], a[0], h);
+    uint32_t second = nt_close(q[1], a[0], h);
+    uint32_t h2 = create(0x7fffffff, 0);
+    distinct = !first && second == 0xC0000008u && h2 == h;
+  } else if (!strcmp(mode, "file-write")) {
+    int f[2];
+    if (pipe(f)) return 4;
+    uint32_t h = create(0x7fffffff, 0);
+    uint32_t words[16] = { 21, 0, 0, h };
+    uint32_t back[16] = {0};
+    distinct = nt_write_file(f[1], words) == 64 && read(f[0], back, sizeof back) == sizeof back && back[3] == h;
+    nt_close(q[1], a[0], h);
   } else if (!strcmp(mode, "different")) {
     uint32_t h = create(0x7fffffff, 0);
     nt_close(q[1], a[0], h);
@@ -185,8 +206,14 @@ class SemaphorePoolPreloadTest(unittest.TestCase):
     def test_a_semaphore_named_in_another_request_is_really_closed(self):
         self.assertEqual(self.run_program("used"), (2, 1, 1, 1))
 
-    def test_a_kept_semaphore_named_after_its_close_is_not_handed_out(self):
-        self.assertEqual(self.run_program("freed-then-used"), (2, 0, 1, 1))
+    def test_a_kept_semaphore_named_after_its_close_is_closed_before_that_request(self):
+        self.assertEqual(self.run_program("freed-then-used"), (2, 1, 1, 1))
+
+    def test_a_second_close_fails_like_wine_and_keeps_the_semaphore(self):
+        self.assertEqual(self.run_program("double-close"), (1, 0, 0, 1))
+
+    def test_a_64_byte_file_write_from_ntdll_is_written(self):
+        self.assertEqual(self.run_program("file-write"), (1, 1, 0, 1))
 
     def test_only_an_identical_create_reuses_a_semaphore(self):
         self.assertEqual(self.run_program("different"), (2, 0, 0, 1))

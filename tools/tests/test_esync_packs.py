@@ -637,6 +637,20 @@ class SelectTest(SyncTestCase):
             self.assertEqual(self.select(tool, self.env())[1]["BL_SYNC_PACK"], pack["id"])
         self.assertEqual(json.loads((root / "prefixes.json").read_text())[prefix]["env"]["BL_SYNC_PACK"], pack["id"])
 
+    def test_a_running_prefix_keeps_an_explicit_semaphore_pool_setting(self):
+        root = self.store()
+        tool = make_tool(self.tools, "Proton Experimental (ARM64)", fsync=True)
+        prefix = os.path.realpath("/compatdata/42/pfx")
+        self.select(tool, self.env())
+        rows = json.loads((root / "prefixes.json").read_text())
+        rows[prefix]["env"]["BL_SEMPOOL"] = "40,21"
+        (root / "prefixes.json").write_text(json.dumps(rows))
+        with mock.patch.dict(GLOBALS, {"server_running": lambda path: True}):
+            self.assertEqual(self.select(tool, self.env())[1]["BL_SEMPOOL"], "40,21")
+            command, env, said = self.select(tool, self.env(BL_SEMPOOL="0"))
+        self.assertEqual(env["BL_SEMPOOL"], "0")
+        self.assertIn("keeping its sync choice", said)
+
     def test_a_running_prefix_drops_a_pack_that_no_longer_fits(self):
         root = self.store()
         tool = make_tool(self.tools, "Proton Experimental (ARM64)")

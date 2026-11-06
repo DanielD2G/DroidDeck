@@ -9,7 +9,12 @@
 
 /* Some Unity games create and close an unused unnamed semaphore thousands of times a second, each
  * a wineserver round trip. A semaphore no request named between its create and its close stays
- * open and answers the next identical create. BL_SEMPOOL holds "<create_semaphore>,<close_handle>". */
+ * open and answers the next identical create. BL_SEMPOOL holds "<create_semaphore>,<close_handle>".
+ *
+ * A pooled handle is open on the server but closed for the program, so a request naming one may be
+ * a use after close: the handle then waits in sp_zombie until a thread whose request and reply fds
+ * are known closes it for real, before its own request reaches the server. Replies are only forged
+ * on those fds, learnt from a create whose reply came back on them. */
 
 int bl_from_ntdll(const void *caller) __attribute__((visibility("hidden")));
 
@@ -18,6 +23,9 @@ int bl_from_ntdll(const void *caller) __attribute__((visibility("hidden")));
 #define SP_OBJATTR 16
 #define SP_FREE 16
 #define SP_LIVE 64
+#define SP_ZOMBIE 64
+#define SP_OBJ_INHERIT 0x2u
+#define SP_INVALID_HANDLE 0xC0000008u
 
 struct sp_key {
   uint32_t access, initial, max, attributes;
@@ -32,20 +40,38 @@ struct sp_entry {
 static int sp_state = -1;
 static int sp_create_req, sp_close_req;
 static pthread_mutex_t sp_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t sp_fork_once = PTHREAD_ONCE_INIT;
 static struct sp_entry sp_live[SP_LIVE];
 static int sp_nlive;
 static struct sp_entry sp_free[SP_FREE];
 static int sp_nfree;
+static uint32_t sp_zombie[SP_ZOMBIE];
+static int sp_nzombie;
 static int sp_tracked;
 
 enum { SP_IDLE, SP_CAPTURE, SP_FAKE };
 static __thread int sp_pending;
 static __thread unsigned char sp_reply[SP_MSG];
 static __thread struct sp_key sp_capture;
+static __thread int sp_capture_fd = -1;
+static __thread int sp_wfd = -1;
+static __thread int sp_rfd = -1;
 
 static ssize_t (*sp_real_read)(int, void *, size_t);
 static ssize_t (*sp_real_write)(int, const void *, size_t);
 static ssize_t (*sp_real_writev)(int, const struct iovec *, int);
+
+static void sp_after_fork(void) {
+  pthread_mutex_init(&sp_lock, NULL);
+  sp_nlive = sp_nfree = sp_nzombie = 0;
+  __atomic_store_n(&sp_tracked, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&sp_state, 0, __ATOMIC_RELEASE);
+  sp_pending = SP_IDLE;
+}
+
+static void sp_watch_fork(void) {
+  pthread_atfork(NULL, NULL, sp_after_fork);
+}
 
 static int sp_on(void) {
   int s = __atomic_load_n(&sp_state, __ATOMIC_ACQUIRE);
@@ -56,8 +82,9 @@ static int sp_on(void) {
   if (create >= 0 && end && *end == ',') close = strtol(end + 1, &end, 10);
   s = create >= 0 && create < 4096 && close >= 0 && close < 4096 && create != close && *end == 0;
   if (s) {
-    sp_create_req = (int)create;
-    sp_close_req = (int)close;
+    __atomic_store_n(&sp_create_req, (int)create, __ATOMIC_RELAXED);
+    __atomic_store_n(&sp_close_req, (int)close, __ATOMIC_RELAXED);
+    pthread_once(&sp_fork_once, sp_watch_fork);
   }
   __atomic_store_n(&sp_state, s, __ATOMIC_RELEASE);
   return s;
@@ -77,7 +104,7 @@ static void sp_fake(uint32_t error, uint32_t handle) {
 }
 
 static void sp_count(void) {
-  __atomic_store_n(&sp_tracked, sp_nlive + sp_nfree, __ATOMIC_RELEASE);
+  __atomic_store_n(&sp_tracked, sp_nlive + sp_nfree + sp_nzombie, __ATOMIC_RELEASE);
 }
 
 static void sp_drop_free(int i) {
@@ -88,14 +115,29 @@ static void sp_drop_live(int i) {
   sp_live[i] = sp_live[--sp_nlive];
 }
 
+static int sp_find_free(uint32_t handle) {
+  for (int i = 0; i < sp_nfree; i++)
+    if (sp_free[i].handle == handle) return i;
+  return -1;
+}
+
+static int sp_find_zombie(uint32_t handle) {
+  for (int i = 0; i < sp_nzombie; i++)
+    if (sp_zombie[i] == handle) return i;
+  return -1;
+}
+
 static void sp_mark(const unsigned char *p, size_t n, uint32_t except) {
   for (size_t off = 0; off + 4 <= n; off += 4) {
     uint32_t v = sp_u32(p + off);
     if (!v || v == except) continue;
     for (int i = 0; i < sp_nlive; i++)
       if (sp_live[i].handle == v) sp_live[i].dirty = 1;
-    for (int i = sp_nfree - 1; i >= 0; i--)
-      if (sp_free[i].handle == v) sp_drop_free(i);
+    int i = sp_find_free(v);
+    if (i >= 0) {
+      sp_zombie[sp_nzombie++] = v;
+      sp_drop_free(i);
+    }
   }
 }
 
@@ -106,6 +148,25 @@ static void sp_scan(const struct iovec *iov, int n, uint32_t except) {
   for (int i = 1; i < n; i++) sp_mark(iov[i].iov_base, iov[i].iov_len, except);
   sp_count();
   pthread_mutex_unlock(&sp_lock);
+}
+
+/* Runs inside ntdll's server call before this thread's request is written, so the extra round
+ * trips cannot interleave with another request on these fds. */
+static int sp_bury(int wfd, int rfd) {
+  if (!__atomic_load_n(&sp_tracked, __ATOMIC_ACQUIRE)) return 1;
+  uint32_t dead[SP_ZOMBIE];
+  pthread_mutex_lock(&sp_lock);
+  int n = sp_nzombie;
+  memcpy(dead, sp_zombie, n * sizeof *dead);
+  sp_nzombie = 0;
+  sp_count();
+  pthread_mutex_unlock(&sp_lock);
+  for (int i = 0; i < n; i++) {
+    uint32_t msg[SP_MSG / 4] = { (uint32_t)sp_close_req, 0, 0, dead[i] };
+    unsigned char reply[SP_MSG];
+    if (sp_real_write(wfd, msg, sizeof msg) != SP_MSG || sp_real_read(rfd, reply, sizeof reply) != SP_MSG) return 0;
+  }
+  return 1;
 }
 
 static void sp_track(uint32_t handle, const struct sp_key *key) {
@@ -137,78 +198,101 @@ static int sp_reuse(const struct sp_key *key, uint32_t *handle) {
   return found;
 }
 
-static int sp_keep(uint32_t handle) {
-  int kept = 0;
+enum { SP_PASS, SP_KEPT, SP_GONE };
+
+static int sp_close(uint32_t handle, int forge) {
+  int result = SP_PASS;
   pthread_mutex_lock(&sp_lock);
   for (int i = 0; i < sp_nlive; i++) {
     if (sp_live[i].handle != handle) continue;
-    if (!sp_live[i].dirty && sp_nfree < SP_FREE) {
+    if (forge && !sp_live[i].dirty && sp_nfree < SP_FREE && sp_nzombie + sp_nfree < SP_ZOMBIE) {
       sp_free[sp_nfree++] = sp_live[i];
-      kept = 1;
+      result = SP_KEPT;
     }
     sp_drop_live(i);
     break;
   }
+  if (result == SP_PASS) {
+    int i = sp_find_free(handle);
+    if (i >= 0) {
+      if (forge) {
+        result = SP_GONE;
+      } else {
+        sp_drop_free(i);
+      }
+    }
+    i = sp_find_zombie(handle);
+    if (i >= 0) sp_zombie[i] = sp_zombie[--sp_nzombie];
+  }
   sp_count();
   pthread_mutex_unlock(&sp_lock);
-  return kept;
+  return result;
 }
 
 static int sp_create_key(const struct iovec *iov, int n, struct sp_key *key) {
   const unsigned char *req = iov[0].iov_base;
-  if (n != 2 || iov[1].iov_len != SP_OBJATTR || sp_u32(req + 4) != SP_OBJATTR) return 0;
+  if (n != 2 || iov[1].iov_len != SP_OBJATTR || sp_u32(req + 4) != SP_OBJATTR || sp_u32(req + 8)) return 0;
   const unsigned char *attr = iov[1].iov_base;
-  if (sp_u32(attr) || sp_u32(attr + 8) || sp_u32(attr + 12)) return 0;
+  if (sp_u32(attr) || sp_u32(attr + 8) || sp_u32(attr + 12) || (sp_u32(attr + 4) & SP_OBJ_INHERIT)) return 0;
   *key = (struct sp_key){ sp_u32(req + 12), sp_u32(req + 16), sp_u32(req + 20), sp_u32(attr + 4) };
   return 1;
 }
 
-static ssize_t sp_send(const struct iovec *iov, int n) {
+static ssize_t sp_send(int fd, const struct iovec *iov, int n) {
   const unsigned char *req = iov[0].iov_base;
   int code = (int)sp_u32(req);
-  if (code == sp_close_req && n == 1) {
+  int known = fd == sp_wfd && sp_rfd >= 0;
+  if (code == sp_close_req && n == 1 && !sp_u32(req + 4) && !sp_u32(req + 8)) {
     uint32_t handle = sp_u32(req + SP_HDR);
-    if (sp_keep(handle)) {
-      sp_fake(0, 0);
+    int closed = sp_close(handle, known);
+    if (closed == SP_KEPT || closed == SP_GONE) {
+      sp_fake(closed == SP_KEPT ? 0 : SP_INVALID_HANDLE, 0);
       return SP_MSG;
     }
     sp_scan(iov, n, handle);
+    if (known && !sp_bury(fd, sp_rfd)) return -1;
     return -2;
   }
   sp_scan(iov, n, 0);
+  if (known && !sp_bury(fd, sp_rfd)) return -1;
   struct sp_key key;
   if (code == sp_create_req && sp_create_key(iov, n, &key)) {
     uint32_t handle;
-    if (sp_reuse(&key, &handle)) {
+    if (known && sp_reuse(&key, &handle)) {
       sp_fake(0, handle);
       return SP_MSG + SP_OBJATTR;
     }
     sp_capture = key;
+    sp_capture_fd = fd;
     sp_pending = SP_CAPTURE;
   }
   return -2;
 }
 
 static void sp_resolve(void) {
-  if (!sp_real_read) sp_real_read = (ssize_t (*)(int, void *, size_t))dlsym(RTLD_NEXT, "read");
-  if (!sp_real_write) sp_real_write = (ssize_t (*)(int, const void *, size_t))dlsym(RTLD_NEXT, "write");
-  if (!sp_real_writev) sp_real_writev = (ssize_t (*)(int, const struct iovec *, int))dlsym(RTLD_NEXT, "writev");
+  if (!__atomic_load_n(&sp_real_read, __ATOMIC_ACQUIRE))
+    __atomic_store_n(&sp_real_read, (ssize_t (*)(int, void *, size_t))dlsym(RTLD_NEXT, "read"), __ATOMIC_RELEASE);
+  if (!__atomic_load_n(&sp_real_write, __ATOMIC_ACQUIRE))
+    __atomic_store_n(&sp_real_write, (ssize_t (*)(int, const void *, size_t))dlsym(RTLD_NEXT, "write"), __ATOMIC_RELEASE);
+  if (!__atomic_load_n(&sp_real_writev, __ATOMIC_ACQUIRE))
+    __atomic_store_n(&sp_real_writev, (ssize_t (*)(int, const struct iovec *, int))dlsym(RTLD_NEXT, "writev"),
+                     __ATOMIC_RELEASE);
 }
 
 ssize_t write(int fd, const void *buf, size_t count) {
-  if (__builtin_expect(!sp_real_write, 0)) sp_resolve();
+  if (__builtin_expect(!__atomic_load_n(&sp_real_write, __ATOMIC_ACQUIRE), 0)) sp_resolve();
   if (count == SP_MSG && sp_on() && bl_from_ntdll(__builtin_return_address(0))) {
     struct iovec one = { (void *)buf, count };
-    ssize_t r = sp_send(&one, 1);
+    ssize_t r = sp_send(fd, &one, 1);
     if (r != -2) return r;
   }
   return sp_real_write(fd, buf, count);
 }
 
 ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
-  if (__builtin_expect(!sp_real_writev, 0)) sp_resolve();
+  if (__builtin_expect(!__atomic_load_n(&sp_real_writev, __ATOMIC_ACQUIRE), 0)) sp_resolve();
   if (iovcnt > 0 && iov[0].iov_len == SP_MSG && sp_on() && bl_from_ntdll(__builtin_return_address(0))) {
-    ssize_t r = sp_send(iov, iovcnt);
+    ssize_t r = sp_send(fd, iov, iovcnt);
     if (r != -2) return r;
     size_t total = 0;
     for (int i = 0; i < iovcnt; i++) total += iov[i].iov_len;
@@ -220,18 +304,23 @@ ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
 }
 
 ssize_t read(int fd, void *buf, size_t count) {
-  if (__builtin_expect(!sp_real_read, 0)) sp_resolve();
-  if (__builtin_expect(sp_pending != SP_IDLE, 0) && count == SP_MSG) {
+  if (__builtin_expect(!__atomic_load_n(&sp_real_read, __ATOMIC_ACQUIRE), 0)) sp_resolve();
+  if (__builtin_expect(sp_pending != SP_IDLE, 0) && count == SP_MSG && bl_from_ntdll(__builtin_return_address(0))) {
     if (sp_pending == SP_FAKE) {
+      if (fd != sp_rfd) return sp_real_read(fd, buf, count);
       sp_pending = SP_IDLE;
       memcpy(buf, sp_reply, SP_MSG);
       return SP_MSG;
     }
+    if (fd == sp_capture_fd || (sp_rfd >= 0 && fd != sp_rfd)) return sp_real_read(fd, buf, count);
     sp_pending = SP_IDLE;
     struct sp_key key = sp_capture;
     ssize_t r = sp_real_read(fd, buf, count);
-    if (r == SP_MSG && !sp_u32(buf) && !sp_u32((unsigned char *)buf + 4) && sp_u32((unsigned char *)buf + 8))
+    if (r == SP_MSG && !sp_u32(buf) && !sp_u32((unsigned char *)buf + 4) && sp_u32((unsigned char *)buf + 8)) {
+      sp_wfd = sp_capture_fd;
+      sp_rfd = fd;
       sp_track(sp_u32((unsigned char *)buf + 8), &key);
+    }
     return r;
   }
   return sp_real_read(fd, buf, count);
