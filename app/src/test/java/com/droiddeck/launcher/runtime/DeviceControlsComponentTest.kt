@@ -51,6 +51,7 @@ class DeviceControlsComponentTest {
     }
 
     private fun tick() = shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(300))
+    private fun reconcile() = shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(2100))
     private fun request(name: String, text: String) {
         File(directory, "$name.request").writeText(text)
         tick()
@@ -60,7 +61,7 @@ class DeviceControlsComponentTest {
         request("volume", "999")
         assertEquals(audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC), audio.getStreamVolume(AudioManager.STREAM_MUSIC))
         audio.setStreamVolume(AudioManager.STREAM_MUSIC, 3, 0)
-        tick()
+        reconcile()
         assertEquals("3", File(directory, "volume.state").readText().split(" ").first())
         request("volume", "invalid")
         assertEquals(3, audio.getStreamVolume(AudioManager.STREAM_MUSIC))
@@ -112,7 +113,7 @@ class DeviceControlsComponentTest {
         assertEquals("BRIGHTNESS", intent.getStringExtra(com.droiddeck.launcher.core.SteamIntegration.EXTRA_FEATURE))
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(121))
         WriteSettingsShadow.writable = true
-        tick()
+        reconcile()
         assertEquals(128, Settings.System.getInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS))
         assertTrue(notifications.activeNotifications.isEmpty())
     }
