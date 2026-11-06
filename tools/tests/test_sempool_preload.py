@@ -136,6 +136,16 @@ int main(int argc, char **argv) {
     uint32_t back[16] = {0};
     distinct = nt_write_file(f[1], words) == 64 && read(f[0], back, sizeof back) == sizeof back && back[3] == h;
     nt_close(q[1], a[0], h);
+  } else if (!strcmp(mode, "file-write-pooled") || !strcmp(mode, "zombie-close")) {
+    int f[2];
+    if (pipe(f)) return 4;
+    uint32_t h = create(0x7fffffff, 0);
+    nt_close(q[1], a[0], h);
+    uint32_t words[16] = { 21, 0, 0, h };
+    uint32_t back[16] = {0};
+    distinct = nt_write_file(f[1], words) == 64 && read(f[0], back, sizeof back) == sizeof back;
+    if (!strcmp(mode, "zombie-close")) distinct &= nt_close(q[1], a[0], h) == 0xC0000008u;
+    distinct &= create(0x7fffffff, 0) != h;
   } else if (!strcmp(mode, "different")) {
     uint32_t h = create(0x7fffffff, 0);
     nt_close(q[1], a[0], h);
@@ -214,6 +224,12 @@ class SemaphorePoolPreloadTest(unittest.TestCase):
 
     def test_a_64_byte_file_write_from_ntdll_is_written(self):
         self.assertEqual(self.run_program("file-write"), (1, 1, 0, 1))
+
+    def test_a_pooled_semaphore_named_in_a_file_write_is_closed_not_leaked(self):
+        self.assertEqual(self.run_program("file-write-pooled"), (2, 1, 0, 1))
+
+    def test_closing_a_semaphore_waiting_to_be_closed_fails_like_wine(self):
+        self.assertEqual(self.run_program("zombie-close"), (2, 1, 0, 1))
 
     def test_only_an_identical_create_reuses_a_semaphore(self):
         self.assertEqual(self.run_program("different"), (2, 0, 0, 1))

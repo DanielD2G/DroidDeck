@@ -51,6 +51,7 @@ class DeviceControlsComponent(context: Context, root: File, private val activity
             if (!running) return
             consume()
             if (ticks++ % RECONCILE_TICKS == 0) {
+                written.clear()
                 if (permissionNotified && Settings.System.canWrite(context))
                     context.getSystemService(NotificationManager::class.java).cancel(PERMISSION_NOTIFICATION)
                 publish()

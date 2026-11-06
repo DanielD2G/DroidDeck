@@ -861,7 +861,7 @@ def keep_live(root, command, env, tool):
             pack = {"id": kept_pack}
         if pack is None or pack["id"] != kept_pack:
             return None
-    asked = {name: env[name] for name in USER_KEYS if name in env}
+    asked = {name: env[name] for name in USER_KEYS if name in env and not re.fullmatch(r"\d+,\d+", env[name])}
     command, env = list(command), dict(env)
     command[0] = kept_command
     for name in LIVE_KEYS:

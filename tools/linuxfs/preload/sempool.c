@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -14,7 +15,7 @@
  * A pooled handle is open on the server but closed for the program, so a request naming one may be
  * a use after close: the handle then waits in sp_zombie until a thread whose request and reply fds
  * are known closes it for real, before its own request reaches the server. Replies are only forged
- * on those fds, learnt from a create whose reply came back on them. */
+ * on those fds, learnt from a request whose well-formed reply came back on another fd. */
 
 int bl_from_ntdll(const void *caller) __attribute__((visibility("hidden")));
 
@@ -56,6 +57,8 @@ static __thread struct sp_key sp_capture;
 static __thread int sp_capture_fd = -1;
 static __thread int sp_wfd = -1;
 static __thread int sp_rfd = -1;
+static __thread int sp_learn_fd = -1;
+static __thread uint32_t sp_learn_max;
 
 static ssize_t (*sp_real_read)(int, void *, size_t);
 static ssize_t (*sp_real_write)(int, const void *, size_t);
@@ -63,7 +66,8 @@ static ssize_t (*sp_real_writev)(int, const struct iovec *, int);
 
 static void sp_after_fork(void) {
   pthread_mutex_init(&sp_lock, NULL);
-  sp_nlive = sp_nfree = sp_nzombie = 0;
+  sp_nlive = sp_nfree = 0;
+  __atomic_store_n(&sp_nzombie, 0, __ATOMIC_RELEASE);
   __atomic_store_n(&sp_tracked, 0, __ATOMIC_RELEASE);
   __atomic_store_n(&sp_state, 0, __ATOMIC_RELEASE);
   sp_pending = SP_IDLE;
@@ -135,7 +139,8 @@ static void sp_mark(const unsigned char *p, size_t n, uint32_t except) {
       if (sp_live[i].handle == v) sp_live[i].dirty = 1;
     int i = sp_find_free(v);
     if (i >= 0) {
-      sp_zombie[sp_nzombie++] = v;
+      sp_zombie[sp_nzombie] = v;
+      __atomic_store_n(&sp_nzombie, sp_nzombie + 1, __ATOMIC_RELEASE);
       sp_drop_free(i);
     }
   }
@@ -150,27 +155,52 @@ static void sp_scan(const struct iovec *iov, int n, uint32_t except) {
   pthread_mutex_unlock(&sp_lock);
 }
 
-/* Runs inside ntdll's server call before this thread's request is written, so the extra round
- * trips cannot interleave with another request on these fds. */
-static int sp_bury(int wfd, int rfd) {
-  if (!__atomic_load_n(&sp_tracked, __ATOMIC_ACQUIRE)) return 1;
-  uint32_t dead[SP_ZOMBIE];
-  pthread_mutex_lock(&sp_lock);
-  int n = sp_nzombie;
-  memcpy(dead, sp_zombie, n * sizeof *dead);
-  sp_nzombie = 0;
-  sp_count();
-  pthread_mutex_unlock(&sp_lock);
-  for (int i = 0; i < n; i++) {
-    uint32_t msg[SP_MSG / 4] = { (uint32_t)sp_close_req, 0, 0, dead[i] };
-    unsigned char reply[SP_MSG];
-    if (sp_real_write(wfd, msg, sizeof msg) != SP_MSG || sp_real_read(rfd, reply, sizeof reply) != SP_MSG) return 0;
-  }
-  return 1;
+static int sp_io(ssize_t done) {
+  if (done == SP_MSG) return 1;
+  if (done >= 0) errno = EPIPE;
+  return 0;
 }
 
+/* Runs inside ntdll's server call before this thread's request is written, so the extra round
+ * trips cannot interleave with another request on these fds. The lock stays held until every
+ * zombie is closed: a close or create racing on another thread cannot reuse a number first. */
+static int sp_bury(int wfd, int rfd) {
+  if (!__atomic_load_n(&sp_nzombie, __ATOMIC_ACQUIRE)) return 1;
+  int ok = 1;
+  pthread_mutex_lock(&sp_lock);
+  while (ok && sp_nzombie) {
+    uint32_t msg[SP_MSG / 4] = { (uint32_t)sp_close_req, 0, 0, sp_zombie[sp_nzombie - 1] };
+    unsigned char reply[SP_MSG];
+    ssize_t done;
+    do done = sp_real_write(wfd, msg, sizeof msg); while (done < 0 && errno == EINTR);
+    ok = sp_io(done);
+    if (ok) {
+      do done = sp_real_read(rfd, reply, sizeof reply); while (done < 0 && errno == EINTR);
+      ok = sp_io(done);
+    }
+    __atomic_store_n(&sp_nzombie, sp_nzombie - 1, __ATOMIC_RELEASE);
+  }
+  sp_count();
+  pthread_mutex_unlock(&sp_lock);
+  return ok;
+}
+
+static void sp_forget(uint32_t handle) {
+  for (int i = sp_nlive - 1; i >= 0; i--)
+    if (sp_live[i].handle == handle) sp_drop_live(i);
+  int i = sp_find_free(handle);
+  if (i >= 0) sp_drop_free(i);
+  i = sp_find_zombie(handle);
+  if (i >= 0) {
+    sp_zombie[i] = sp_zombie[sp_nzombie - 1];
+    __atomic_store_n(&sp_nzombie, sp_nzombie - 1, __ATOMIC_RELEASE);
+  }
+}
+
+/* The server just handed out this number, so anything still recorded under it is already gone. */
 static void sp_track(uint32_t handle, const struct sp_key *key) {
   pthread_mutex_lock(&sp_lock);
+  sp_forget(handle);
   if (sp_nlive == SP_LIVE) {
     int victim = 0;
     for (int i = 0; i < sp_nlive; i++)
@@ -212,17 +242,9 @@ static int sp_close(uint32_t handle, int forge) {
     sp_drop_live(i);
     break;
   }
-  if (result == SP_PASS) {
-    int i = sp_find_free(handle);
-    if (i >= 0) {
-      if (forge) {
-        result = SP_GONE;
-      } else {
-        sp_drop_free(i);
-      }
-    }
-    i = sp_find_zombie(handle);
-    if (i >= 0) sp_zombie[i] = sp_zombie[--sp_nzombie];
+  if (result == SP_PASS && (sp_find_free(handle) >= 0 || sp_find_zombie(handle) >= 0)) {
+    if (forge) result = SP_GONE;
+    else sp_forget(handle);
   }
   sp_count();
   pthread_mutex_unlock(&sp_lock);
@@ -238,9 +260,24 @@ static int sp_create_key(const struct iovec *iov, int n, struct sp_key *key) {
   return 1;
 }
 
+static int sp_request_shape(const struct iovec *iov, int n) {
+  const unsigned char *req = iov[0].iov_base;
+  size_t data = 0;
+  for (int i = 1; i < n; i++) data += iov[i].iov_len;
+  return sp_u32(req) < 4096 && sp_u32(req + 4) == data && sp_u32(req + 8) <= (1u << 26);
+}
+
 static ssize_t sp_send(int fd, const struct iovec *iov, int n) {
   const unsigned char *req = iov[0].iov_base;
   int code = (int)sp_u32(req);
+  if (sp_rfd >= 0 && fd != sp_wfd) {
+    sp_scan(iov, n, 0);
+    return -2;
+  }
+  if (sp_rfd < 0 && sp_request_shape(iov, n)) {
+    sp_learn_fd = fd;
+    sp_learn_max = sp_u32(req + 8);
+  }
   int known = fd == sp_wfd && sp_rfd >= 0;
   if (code == sp_close_req && n == 1 && !sp_u32(req + 4) && !sp_u32(req + 8)) {
     uint32_t handle = sp_u32(req + SP_HDR);
@@ -314,12 +351,24 @@ ssize_t read(int fd, void *buf, size_t count) {
     }
     if (fd == sp_capture_fd || (sp_rfd >= 0 && fd != sp_rfd)) return sp_real_read(fd, buf, count);
     sp_pending = SP_IDLE;
+    sp_learn_fd = -1;
     struct sp_key key = sp_capture;
     ssize_t r = sp_real_read(fd, buf, count);
     if (r == SP_MSG && !sp_u32(buf) && !sp_u32((unsigned char *)buf + 4) && sp_u32((unsigned char *)buf + 8)) {
       sp_wfd = sp_capture_fd;
       sp_rfd = fd;
       sp_track(sp_u32((unsigned char *)buf + 8), &key);
+    }
+    return r;
+  }
+  if (__builtin_expect(sp_learn_fd >= 0, 0) && sp_rfd < 0 && count == SP_MSG && fd != sp_learn_fd &&
+      bl_from_ntdll(__builtin_return_address(0))) {
+    int wfd = sp_learn_fd;
+    sp_learn_fd = -1;
+    ssize_t r = sp_real_read(fd, buf, count);
+    if (r == SP_MSG && sp_u32((unsigned char *)buf + 4) <= sp_learn_max) {
+      sp_wfd = wfd;
+      sp_rfd = fd;
     }
     return r;
   }
