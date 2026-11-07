@@ -49,6 +49,18 @@ uint32_t nt_other(int q, int a, uint32_t code, uint32_t handle) {
   uint32_t words[5] = { code, 0, 0, 7, handle };
   return call(q, a, words, 5, NULL, 0, NULL);
 }
+
+ssize_t nt_write_file(int fd, const uint32_t *words) {
+  ssize_t r = write(fd, words, 64);
+  __asm__ volatile("" ::: "memory");
+  return r;
+}
+
+ssize_t nt_read_file(int fd, uint32_t *words) {
+  ssize_t r = read(fd, words, 64);
+  __asm__ volatile("" ::: "memory");
+  return r;
+}
 """
 
 PROGRAM = r"""
@@ -57,10 +69,13 @@ PROGRAM = r"""
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdlib.h>
 
 uint32_t nt_create_semaphore(int, int, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *);
 uint32_t nt_close(int, int, uint32_t);
 uint32_t nt_other(int, int, uint32_t, uint32_t);
+ssize_t nt_write_file(int, const uint32_t *);
+ssize_t nt_read_file(int, uint32_t *);
 
 static int q[2], a[2];
 static int creates, closes, others;
@@ -94,6 +109,16 @@ int main(int argc, char **argv) {
   pthread_create(&t, NULL, server, NULL);
   const char *mode = argv[1];
   uint32_t first = 0, last = 0, distinct = 0;
+  if (!strcmp(mode, "files-then-loop")) {
+    char out[] = "/tmp/sempool-out-XXXXXX", in[] = "/tmp/sempool-in-XXXXXX";
+    int fo = mkstemp(out), fi = mkstemp(in);
+    uint32_t zeros[16] = {0};
+    if (fo < 0 || fi < 0 || write(fi, zeros, sizeof zeros) != sizeof zeros || lseek(fi, 0, SEEK_SET)) return 5;
+    unlink(out);
+    unlink(in);
+    if (nt_write_file(fo, zeros) != 64 || nt_read_file(fi, zeros) != 64) return 6;
+    mode = "loop";
+  }
   if (!strcmp(mode, "loop")) {
     for (int i = 0; i < 1000; i++) {
       uint32_t h = create(0x7fffffff, 0);
@@ -115,6 +140,30 @@ int main(int argc, char **argv) {
     nt_other(q[1], a[0], 99, h);
     uint32_t h2 = create(0x7fffffff, 0);
     distinct = h2 != h;
+  } else if (!strcmp(mode, "double-close")) {
+    uint32_t h = create(0x7fffffff, 0);
+    uint32_t first = nt_close(q[1], a[0], h);
+    uint32_t second = nt_close(q[1], a[0], h);
+    uint32_t h2 = create(0x7fffffff, 0);
+    distinct = !first && second == 0xC0000008u && h2 == h;
+  } else if (!strcmp(mode, "file-write")) {
+    int f[2];
+    if (pipe(f)) return 4;
+    uint32_t h = create(0x7fffffff, 0);
+    uint32_t words[16] = { 21, 0, 0, h };
+    uint32_t back[16] = {0};
+    distinct = nt_write_file(f[1], words) == 64 && read(f[0], back, sizeof back) == sizeof back && back[3] == h;
+    nt_close(q[1], a[0], h);
+  } else if (!strcmp(mode, "file-write-pooled") || !strcmp(mode, "zombie-close")) {
+    int f[2];
+    if (pipe(f)) return 4;
+    uint32_t h = create(0x7fffffff, 0);
+    nt_close(q[1], a[0], h);
+    uint32_t words[16] = { 21, 0, 0, h };
+    uint32_t back[16] = {0};
+    distinct = nt_write_file(f[1], words) == 64 && read(f[0], back, sizeof back) == sizeof back;
+    if (!strcmp(mode, "zombie-close")) distinct &= nt_close(q[1], a[0], h) == 0xC0000008u;
+    distinct &= create(0x7fffffff, 0) != h;
   } else if (!strcmp(mode, "different")) {
     uint32_t h = create(0x7fffffff, 0);
     nt_close(q[1], a[0], h);
@@ -177,16 +226,33 @@ class SemaphorePoolPreloadTest(unittest.TestCase):
     def test_create_close_loop_reaches_the_server_once(self):
         self.assertEqual(self.run_program("loop"), (1, 0, 0, 1))
 
+    def test_file_io_before_the_first_request_is_not_taken_for_the_server(self):
+        self.assertEqual(self.run_program("files-then-loop"), (1, 0, 0, 1))
+
     def test_missing_or_malformed_request_numbers_change_nothing(self):
         self.assertEqual(self.run_program("loop", protocol=None), (1000, 1000, 0, 1000))
         self.assertEqual(self.run_program("loop", protocol="40"), (1000, 1000, 0, 1000))
         self.assertEqual(self.run_program("loop", protocol="40,21x"), (1000, 1000, 0, 1000))
+        self.assertEqual(self.run_program("loop", protocol="40,"), (1000, 1000, 0, 1000))
+        self.assertEqual(self.run_program("loop", protocol=",21"), (1000, 1000, 0, 1000))
 
     def test_a_semaphore_named_in_another_request_is_really_closed(self):
         self.assertEqual(self.run_program("used"), (2, 1, 1, 1))
 
-    def test_a_kept_semaphore_named_after_its_close_is_not_handed_out(self):
-        self.assertEqual(self.run_program("freed-then-used"), (2, 0, 1, 1))
+    def test_a_kept_semaphore_named_after_its_close_is_closed_before_that_request(self):
+        self.assertEqual(self.run_program("freed-then-used"), (2, 1, 1, 1))
+
+    def test_a_second_close_fails_like_wine_and_keeps_the_semaphore(self):
+        self.assertEqual(self.run_program("double-close"), (1, 0, 0, 1))
+
+    def test_a_64_byte_file_write_from_ntdll_is_written(self):
+        self.assertEqual(self.run_program("file-write"), (1, 1, 0, 1))
+
+    def test_a_pooled_semaphore_named_in_a_file_write_is_closed_not_leaked(self):
+        self.assertEqual(self.run_program("file-write-pooled"), (2, 1, 0, 1))
+
+    def test_closing_a_semaphore_waiting_to_be_closed_fails_like_wine(self):
+        self.assertEqual(self.run_program("zombie-close"), (2, 1, 0, 1))
 
     def test_only_an_identical_create_reuses_a_semaphore(self):
         self.assertEqual(self.run_program("different"), (2, 0, 0, 1))

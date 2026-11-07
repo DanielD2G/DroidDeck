@@ -31,7 +31,10 @@ class DeviceControlsComponent(context: Context, root: File, private val activity
     private var running = false
     private var permissionNotified = false
     private var previous = ""
+    private var published: String? = null
     private var revision = 0L
+    private var ticks = 0
+    private val written = HashMap<String, String>()
     init { prepareBacklight(context, root) }
     private val observer = object : ContentObserver(handler) {
         override fun onChange(selfChange: Boolean) { if (running) publish() }
@@ -48,9 +51,12 @@ class DeviceControlsComponent(context: Context, root: File, private val activity
         override fun run() {
             if (!running) return
             consume()
-            if (permissionNotified && Settings.System.canWrite(context))
-                context.getSystemService(NotificationManager::class.java).cancel(PERMISSION_NOTIFICATION)
-            publish()
+            if (ticks++ % RECONCILE_TICKS == 0) {
+                written.clear()
+                if (permissionNotified && Settings.System.canWrite(context))
+                    context.getSystemService(NotificationManager::class.java).cancel(PERMISSION_NOTIFICATION)
+                publish()
+            }
             handler.postDelayed(this, 250)
         }
     }
@@ -77,9 +83,10 @@ class DeviceControlsComponent(context: Context, root: File, private val activity
             val state = JSONObject().put("brightness", (value.coerceIn(1, 255) - 1) / 254.0)
                 .put("brightnessWritable", Settings.System.canWrite(context)).toString()
             if (force || state != previous) {
-                write("state.json", JSONObject(state).put("revision", ++revision).toString())
+                published = JSONObject(state).put("revision", ++revision).toString()
                 previous = state
             }
+            published?.let { write("state.json", it) }
         } catch (e: Exception) {
             Log.w(TAG, "Could not publish Android controls", e)
         }
@@ -93,6 +100,8 @@ class DeviceControlsComponent(context: Context, root: File, private val activity
             }
             running = true
             permissionNotified = false
+            ticks = 0
+            written.clear()
             context.contentResolver.registerContentObserver(Settings.System.CONTENT_URI, true, observer)
             requests.startWatching()
             context.registerReceiver(volumeSteps, IntentFilter().apply {
@@ -180,11 +189,14 @@ class DeviceControlsComponent(context: Context, root: File, private val activity
     }
 
     private fun write(name: String, text: String) {
+        if (written[name] == text) return
         val file = File(directory, name)
-        if (file.isFile && file.readText() == text) return
-        val staged = File(directory, "$name.tmp")
-        staged.writeText(text)
-        Files.move(staged.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        if (!(file.isFile && file.readText() == text)) {
+            val staged = File(directory, "$name.tmp")
+            staged.writeText(text)
+            Files.move(staged.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        }
+        written[name] = text
     }
 
     companion object {
@@ -193,6 +205,7 @@ class DeviceControlsComponent(context: Context, root: File, private val activity
         private const val STREAM_MUTE_CHANGED_ACTION = "android.media.STREAM_MUTE_CHANGED_ACTION"
         private const val PERMISSION_CHANNEL = "brightness_permission"
         private const val PERMISSION_NOTIFICATION = 0x4442
+        private const val RECONCILE_TICKS = 8
         private val REQUESTS = setOf("brightness.request", "volume.request", "mute.request")
         @JvmStatic fun directory(root: File) = File(root, "etc/droiddeck-device-controls")
         @JvmStatic fun prepareBacklight(context: Context, root: File): File {

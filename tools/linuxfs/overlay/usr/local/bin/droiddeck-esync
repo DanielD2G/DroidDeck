@@ -40,6 +40,7 @@ LOG_LINES = 200
 LIVE_FILE = "prefixes.json"
 LIVE_ROWS = 200
 LIVE_KEYS = ("WINESERVER", "BL_SYNC_PACK", "WINEESYNC", "PROTON_NO_ESYNC", "PROTON_NO_FSYNC", "BL_SYNC", "BL_FSYNC", "WINEFSYNC", "BL_SEMPOOL")
+USER_KEYS = ("BL_SEMPOOL",)
 CACHE_ROWS = 512
 TEMP_AGE = 3600
 GC_GRACE = 600
@@ -860,9 +861,12 @@ def keep_live(root, command, env, tool):
             pack = {"id": kept_pack}
         if pack is None or pack["id"] != kept_pack:
             return None
+    asked = {name: env[name] for name in USER_KEYS if name in env and not re.fullmatch(r"\s*[+-]?\d+,\s*[+-]?\d+", env[name])}
     command, env = list(command), dict(env)
     command[0] = kept_command
     for name in LIVE_KEYS:
+        if name in asked:
+            continue
         value = row["env"].get(name)
         if isinstance(value, str):
             env[name] = value
