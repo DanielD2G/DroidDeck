@@ -161,11 +161,13 @@ class SemaphorePoolPreloadTest(unittest.TestCase):
         env = dict(os.environ)
         env.pop("LD_PRELOAD", None)
         env.pop("BL_SEMPOOL", None)
-        settings = ["LD_PRELOAD=" + str(self.preload)] + (["BL_SEMPOOL=" + protocol] if protocol else [])
+        if protocol:
+            env["BL_SEMPOOL"] = protocol
         if self.prefix:
-            cmd = list(self.prefix) + [arg for s in settings for arg in ("-E", s)] + [str(self.program), mode]
+            # qemu splits -E values on commas, so BL_SEMPOOL reaches the guest through qemu's own environment.
+            cmd = list(self.prefix) + ["-E", "LD_PRELOAD=" + str(self.preload), str(self.program), mode]
         else:
-            env.update(s.split("=", 1) for s in settings)
+            env["LD_PRELOAD"] = str(self.preload)
             cmd = [str(self.program), mode]
         out = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stderr)
