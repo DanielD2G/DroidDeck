@@ -22,6 +22,8 @@
  * in it still reaches the server with the handle open. */
 
 int bl_from_ntdll(const void *caller) __attribute__((visibility("hidden")));
+int bl_nl_write(int fd, const void *buf, size_t count, ssize_t *rc) __attribute__((visibility("hidden")));
+int bl_nl_writev(int fd, const struct iovec *iov, int iovcnt, ssize_t *rc) __attribute__((visibility("hidden")));
 
 #define SP_MSG 64
 #define SP_HDR 12
@@ -344,6 +346,8 @@ static void sp_resolve(void) {
 }
 
 ssize_t write(int fd, const void *buf, size_t count) {
+  ssize_t nl;
+  if (bl_nl_write(fd, buf, count, &nl)) return nl;
   if (__builtin_expect(!__atomic_load_n(&sp_real_write, __ATOMIC_ACQUIRE), 0)) sp_resolve();
   if (count == SP_MSG && sp_on() && bl_from_ntdll(__builtin_return_address(0))) {
     struct iovec one = { (void *)buf, count };
@@ -360,6 +364,8 @@ ssize_t write(int fd, const void *buf, size_t count) {
 }
 
 ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
+  ssize_t nl;
+  if (bl_nl_writev(fd, iov, iovcnt, &nl)) return nl;
   if (__builtin_expect(!__atomic_load_n(&sp_real_writev, __ATOMIC_ACQUIRE), 0)) sp_resolve();
   if (iovcnt > 0 && iov[0].iov_len == SP_MSG && sp_on() && bl_from_ntdll(__builtin_return_address(0))) {
     ssize_t r = sp_send_masked(fd, iov, iovcnt);
