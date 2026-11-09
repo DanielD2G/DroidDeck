@@ -29,6 +29,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -1655,6 +1656,7 @@ static void reply_attr(struct nl_reply *out, unsigned char *message, int type,
         return;
     }
     attr = (struct rtattr *) (message + offset);
+    memset(attr, 0, total);
     attr->rta_type = (unsigned short) type;
     attr->rta_len = (unsigned short) RTA_LENGTH(len);
     if (len > 0) memcpy(RTA_DATA(attr), data, len);
@@ -2154,4 +2156,15 @@ ssize_t send(int fd, const void *buffer, size_t length, int flags) {
         return -1;
     }
     return real(fd, buffer, length, flags);
+}
+
+__attribute__((visibility("hidden"))) int bl_nl_write(int fd, const void *buffer, size_t length, ssize_t *rc) {
+    return bl_nl_owns(fd) && deliver(fd, buffer, length, 0, rc);
+}
+
+__attribute__((visibility("hidden"))) int bl_nl_writev(int fd, const struct iovec *iov, int iovcnt, ssize_t *rc) {
+    if (iovcnt < 0 || !bl_nl_owns(fd)) return 0;
+    struct msghdr msg = { .msg_iov = (struct iovec *) iov, .msg_iovlen = (size_t) iovcnt };
+    *rc = sendmsg_request(fd, &msg, 0);
+    return 1;
 }
