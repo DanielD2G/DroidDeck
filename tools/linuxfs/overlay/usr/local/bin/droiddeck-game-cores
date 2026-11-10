@@ -1,0 +1,288 @@
+#!/usr/bin/python3
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+POLL = 2.0
+RESCAN = 10.0
+STEAM_CLIENT = 769
+FITS = 0.9
+FULL = 0.9
+FULL_SAMPLES = 2
+RETRY_AFTER = 60.0
+RETRY_LIMIT = 960.0
+TOP_ENTER = 0.3
+TOP_LEAVE = 0.1
+TOP_THREADS = 2
+ALL = "all"
+TOP = "top"
+
+
+def log(message):
+    print("droiddeck-game-cores: " + message, flush=True)
+
+
+def tasks(proc, pid):
+    try:
+        return [int(tid) for tid in os.listdir(proc / str(pid) / "task") if tid.isdigit()]
+    except OSError:
+        return []
+
+
+def read_stat(proc, pid, tid):
+    try:
+        line = (proc / str(pid) / "task" / str(tid) / "stat").read_text()
+        fields = line[line.rindex(")") + 2:].split()
+        return int(fields[11]) + int(fields[12]), int(fields[36])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def wine_prefix(proc, pid):
+    try:
+        entries = (proc / str(pid) / "environ").read_bytes().split(b"\0")
+    except OSError:
+        return None
+    for entry in entries:
+        if entry.startswith(b"WINEPREFIX="):
+            return entry[len(b"WINEPREFIX="):].rstrip(b"/") or None
+    return None
+
+
+def comm(proc, pid):
+    try:
+        return (proc / str(pid) / "comm").read_text().strip()
+    except OSError:
+        return None
+
+
+def pick_top(top, shares, limit):
+    wanted = [tid for tid, share in shares.items() if share >= (TOP_LEAVE if tid in top else TOP_ENTER)]
+    wanted.sort(key=lambda tid: (tid not in top, -shares[tid]))
+    return set(wanted[:limit])
+
+
+class Cores:
+
+    def get(self, tid):
+        return os.sched_getaffinity(tid)
+
+    def set(self, tid, cpus):
+        os.sched_setaffinity(tid, cpus)
+
+
+class Placer:
+    def __init__(self, proc=Path("/proc"), cpufreq=Path("/sys/devices/system/cpu"), cores=None,
+                 clock=time.monotonic, hz=None):
+        self.proc = proc
+        self.cpufreq = cpufreq
+        self.cores = cores or Cores()
+        self.clock = clock
+        self.hz = hz or os.sysconf("SC_CLK_TCK")
+        self.reported = None
+        self.forget()
+
+    def forget(self):
+        self.pid = None
+        self.allowed = self.fast = None
+        self.mode = None
+        self.top = set()
+        self.ticks = {}
+        self.sampled = None
+        self.full = 0
+        self.retry = None
+        self.wait = RETRY_AFTER
+        self.servers = []
+        self.scanned = None
+        self.touched = set()
+
+    def freq(self, cpu, name):
+        try:
+            return int((self.cpufreq / f"cpu{cpu}/cpufreq/{name}").read_text())
+        except (OSError, ValueError):
+            return 0
+
+    def speed(self, cpu):
+        return self.freq(cpu, "scaling_max_freq") or self.freq(cpu, "cpuinfo_max_freq")
+
+    def fastest(self, cpus):
+        top = max(self.freq(cpu, "cpuinfo_max_freq") for cpu in cpus)
+        return {cpu for cpu in cpus if top and self.freq(cpu, "cpuinfo_max_freq") == top}
+
+    def find_servers(self):
+        prefix = wine_prefix(self.proc, self.pid)
+        if prefix is None:
+            return []
+        found = []
+        for name in os.listdir(self.proc):
+            if name.isdigit() and comm(self.proc, name) == "wineserver" and wine_prefix(self.proc, name) == prefix:
+                found.append(int(name))
+        return found
+
+    def sample(self, members):
+        now = self.clock()
+        seconds = None if self.sampled is None else now - self.sampled
+        self.sampled = now
+        ticks = {}
+        shares = {}
+        demand = 0.0
+        fast_speed = max(self.speed(cpu) for cpu in self.fast) or 1
+        for pid, tids in members.items():
+            for tid in tids:
+                stat = read_stat(self.proc, pid, tid)
+                if stat is None:
+                    continue
+                ticks[tid] = stat[0]
+                before = self.ticks.get(tid)
+                if before is None or not seconds or seconds <= 0:
+                    continue
+                share = (stat[0] - before) / self.hz / seconds
+                weight = 1.0 if stat[1] in self.fast else min(1.0, (self.speed(stat[1]) or fast_speed) / fast_speed)
+                demand += share * weight
+                if pid == self.pid:
+                    shares[tid] = share
+        self.ticks = ticks
+        return (demand, shares) if seconds else None
+
+    def choose(self, demand):
+        room = len(self.fast)
+        now = self.clock()
+        if self.mode == ALL:
+            self.full = self.full + 1 if demand >= FULL * room else 0
+            if self.full >= FULL_SAMPLES:
+                self.full = 0
+                self.retry = now + self.wait
+                self.wait = min(self.wait * 2, RETRY_LIMIT)
+                return TOP
+            return ALL
+        if demand <= FITS * room and (self.retry is None or now >= self.retry):
+            return ALL
+        return TOP
+
+    def apply(self, tid, cpus):
+        try:
+            if self.cores.get(tid) != cpus:
+                self.cores.set(tid, cpus)
+            self.touched.add(tid)
+        except OSError:
+            self.touched.discard(tid)
+
+    def tick(self, pid):
+        if pid != self.pid:
+            self.release()
+            self.pid = pid
+        if self.allowed is None:
+            try:
+                self.allowed = set(self.cores.get(pid))
+            except OSError:
+                self.forget()
+                return
+            self.fast = self.fastest(self.allowed)
+            if not self.fast or self.fast == self.allowed:
+                self.fast = set()
+        if not self.fast:
+            return
+        now = self.clock()
+        if self.scanned is None or now - self.scanned >= RESCAN:
+            self.scanned = now
+            self.servers = self.find_servers()
+        members = {member: tasks(self.proc, member) for member in [pid] + self.servers}
+        if not members[pid]:
+            self.release()
+            return
+        sampled = self.sample(members)
+        if sampled is None:
+            return
+        demand, shares = sampled
+        mode = self.choose(demand)
+        if mode == TOP:
+            self.top = pick_top(self.top, shares, min(TOP_THREADS, len(self.fast)))
+        else:
+            self.top = set()
+        self.touched &= {tid for tids in members.values() for tid in tids}
+        for member, tids in members.items():
+            for tid in tids:
+                on_fast = mode == ALL or tid in self.top
+                self.apply(tid, self.fast if on_fast else self.allowed)
+        if mode != self.mode:
+            self.mode = mode
+            cores = ",".join(str(cpu) for cpu in sorted(self.fast))
+            self.report(f"game {pid} needs {demand:.2f} fast cores: " + (
+                f"the whole game and wineserver on {cores}" if mode == ALL
+                else f"only its busiest threads on {cores}"))
+
+    def release(self):
+        if self.allowed is not None:
+            for tid in self.touched:
+                try:
+                    self.cores.set(tid, self.allowed)
+                except OSError:
+                    pass
+            if self.mode is not None:
+                self.report(f"game {self.pid} released")
+        self.forget()
+
+    def report(self, message):
+        if message != self.reported:
+            self.reported = message
+            log(message)
+
+
+def focused(snapshot):
+    window = snapshot.get("focusedWindow")
+    for entry in snapshot.get("focusableWindows") or []:
+        if entry.get("window") == window:
+            return entry.get("appId"), entry.get("pid")
+    return None, None
+
+
+class Governor:
+    def __init__(self, focus_path, placer=None):
+        self.focus_path = Path(focus_path)
+        self.placer = placer or Placer()
+        self.seen = None
+        self.app = self.pid = None
+
+    def read_focus(self):
+        try:
+            stamp = self.focus_path.stat().st_mtime_ns
+        except OSError:
+            return
+        if stamp == self.seen:
+            return
+        try:
+            self.app, self.pid = focused(json.loads(self.focus_path.read_text()))
+        except (OSError, ValueError, AttributeError):
+            return
+        self.seen = stamp
+
+    def tick(self):
+        self.read_focus()
+        if self.pid is None or self.app in (None, 0, STEAM_CLIENT):
+            self.placer.release()
+            return
+        self.placer.tick(self.pid)
+
+    def stop(self, *_):
+        self.placer.release()
+        sys.exit(0)
+
+
+def main(argv):
+    if len(argv) != 1:
+        print("usage: droiddeck-game-cores <agent focus.json>", file=sys.stderr)
+        return 2
+    governor = Governor(argv[0])
+    signal.signal(signal.SIGTERM, governor.stop)
+    signal.signal(signal.SIGHUP, governor.stop)
+    signal.signal(signal.SIGINT, governor.stop)
+    while True:
+        governor.tick()
+        time.sleep(POLL)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
