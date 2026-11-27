@@ -25,6 +25,7 @@
 #include <gnu/lib-names.h>
 #endif
 #include <fcntl.h>
+#include <linux/futex.h>
 #include <linux/input.h>
 #include <linux/joystick.h>
 #include <linux/uinput.h>
@@ -37,6 +38,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/eventfd.h>
+#include <sys/file.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -56,6 +58,59 @@
 #include <unistd.h>
 
 #define EXPORT extern "C" __attribute__((visibility("default")))
+
+struct SymbolSlot {
+  std::atomic<void *> fn{nullptr};
+  std::atomic<bool> resolved{false};
+};
+
+template <typename Fn> static Fn resolved_symbol(SymbolSlot &slot, void *handle, const char *name) {
+  if (!slot.resolved.load(std::memory_order_acquire)) {
+    slot.fn.store(dlsym(handle, name), std::memory_order_relaxed);
+    slot.resolved.store(true, std::memory_order_release);
+  }
+  return reinterpret_cast<Fn>(slot.fn.load(std::memory_order_relaxed));
+}
+
+enum class Next : size_t {
+  open,
+  openat,
+  close,
+  write,
+  ioctl,
+  poll,
+  ppoll,
+  select,
+  stat,
+  stat64,
+  fstat,
+  fstat64,
+  xstat,
+  xstat64,
+  fxstat,
+  fxstat64,
+  statx,
+  statfs,
+  fstatfs,
+  access,
+  faccessat,
+  opendir,
+  scandir,
+  inotify_add_watch,
+  count
+};
+
+static const char *const next_names[] = {"open", "openat", "close", "write", "ioctl", "poll", "ppoll", "select", "stat", "stat64", "fstat", "fstat64", "__xstat", "__xstat64", "__fxstat", "__fxstat64", "statx", "statfs", "fstatfs", "access", "faccessat", "opendir", "scandir", "inotify_add_watch"};
+static_assert(sizeof(next_names) / sizeof(next_names[0]) == static_cast<size_t>(Next::count), "next_names");
+static SymbolSlot next_slots[static_cast<size_t>(Next::count)];
+
+template <typename Fn> static Fn next_symbol(Next which) {
+  return resolved_symbol<Fn>(next_slots[static_cast<size_t>(which)], RTLD_NEXT, next_names[static_cast<size_t>(which)]);
+}
+
+static void resolve_next_symbols() {
+  for (size_t i = 0; i < static_cast<size_t>(Next::count); i++) next_symbol<void *>(static_cast<Next>(i));
+}
 
 #ifdef __GLIBC__
 typedef unsigned long ioctl_request_t;
@@ -157,6 +212,8 @@ struct FakeController {
   bool closed = false;
   bool needs_keyframe = true;
   bool mouse = false;
+  int playing_ff = -1;
+  pid_t owner = getpid();
 
   ~FakeController() {
     if (ring) munmap(ring, mapping_size);
@@ -195,11 +252,17 @@ static constexpr size_t kSnapshotButtonCount =
 
 namespace Logger {
 void init();
+void log(const char *message, ...);
 }
 
 static void controller_fork_prepare();
 static void controller_fork_parent();
 static void controller_fork_child();
+
+// bionic: libc's own start-up calls hooked functions (access) before environ is set. Settings read
+// then would be empty and cached for good, so until environ exists hooks see defaults, uncached.
+extern "C" char **environ;
+static bool env_ready() { return environ != nullptr; }
 
 struct FakeConfig {
   const char *hook_dir;
@@ -214,6 +277,10 @@ struct FakeConfig {
 // would throw a recursive-init error there, so the fields are filled without allocating, and a
 // reentry on the initializing thread gets them while other threads wait for the fork handlers.
 static FakeConfig &config() {
+  if (!env_ready()) {
+    static FakeConfig early = {"/data/data/com.termux/files/home/fake-input", nullptr, false, false, false};
+    return early;
+  }
   static FakeConfig cfg;
   static std::atomic<int> state{0};
   static __thread bool initializing __attribute__((tls_model("initial-exec")));
@@ -285,6 +352,68 @@ static const char *fake_udev_data_dir() { return config().udev_data_dir; }
 static bool fake_vibration_enabled() { return config().vibration_enabled; }
 static bool fake_xbox360_identity() { return config().xbox360_identity; }
 static bool fake_uinput_enabled() { return config().uinput_enabled; }
+
+static bool process_is_steam_client();
+
+// Steam and its Remote Play client write the same shared slots; the caller's mutex serialises its own threads.
+// Without the lock Steam stays the only writer, as before streaming_client could open these devices. The wait
+// is bounded because a session freeze can stop the holder, and callers wait with controller_mutex held.
+class ProcessSlotLock {
+public:
+  ProcessSlotLock(int &fd, const char *name, int timeout_ms) : fd_(fd) {
+    int saved_errno = errno;
+    if (fd_ < 0) {
+      std::string path = std::string(fake_hook_dir()) + "/." + name + ".lock";
+      fd_ = fd = static_cast<int>(syscall(SYS_openat, AT_FDCWD, path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600));
+    }
+    int error = fd_ < 0 ? errno : 0;
+    if (fd_ >= 0) {
+      struct timespec start, now, pause = {0, 1000 * 1000};
+      clock_gettime(CLOCK_MONOTONIC, &start);
+      for (;;) {
+        if (flock(fd_, LOCK_EX | LOCK_NB) == 0) {
+          locked_ = true;
+          break;
+        }
+        if (errno == EINTR) continue;
+        if (errno != EWOULDBLOCK) {
+          error = errno;
+          break;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if ((now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000 >= timeout_ms) {
+          busy_ = true;
+          break;
+        }
+        nanosleep(&pause, nullptr);
+      }
+    }
+    if (busy_) {
+      static std::atomic<unsigned> waits;
+      unsigned n = ++waits;
+      if ((n & (n - 1)) == 0) Logger::log("lock: %s still held after %d ms, skipped (x%u)\n", name, timeout_ms, n);
+    } else if (!locked_) {
+      static std::atomic<bool> noted{false};
+      if (!noted.exchange(true))
+        Logger::log("lock: %s not taken (%s)%s\n", name, strerror(error),
+                    process_is_steam_client() ? "" : "; this process leaves the shared slots alone");
+    }
+    errno = saved_errno;
+  }
+  ~ProcessSlotLock() {
+    int saved_errno = errno;
+    if (locked_) flock(fd_, LOCK_UN);
+    errno = saved_errno;
+  }
+  bool may_write() const { return locked_ || (!busy_ && process_is_steam_client()); }
+  ProcessSlotLock(const ProcessSlotLock &) = delete;
+  ProcessSlotLock &operator=(const ProcessSlotLock &) = delete;
+
+private:
+  int fd_;
+  bool locked_ = false;
+  bool busy_ = false;
+};
 
 static bool ring_paths_loaded = false;
 static int next_ff_id = 0;
@@ -367,6 +496,7 @@ void log(const char *message, ...) {
 }
 
 __attribute__((constructor)) static void library_init() {
+  resolve_next_symbols();
   config();
   controller_mutex();
   controller_map();
@@ -411,20 +541,47 @@ __attribute__((visibility("hidden"))) static void send_ff_effect(const struct ff
     send_vibration(effect.u.periodic.magnitude, effect.u.periodic.magnitude, duration, slot);
 }
 
+static std::unordered_map<int, const FakeController *> &ff_players() {
+  static auto *players = new std::unordered_map<int, const FakeController *>();
+  return *players;
+}
+
+__attribute__((visibility("hidden"))) static void ff_played(FakeController &controller, int id) {
+  controller.playing_ff = id;
+  controller.owner = getpid();
+  ff_players()[controller.slot] = &controller;
+}
+
+__attribute__((visibility("hidden"))) static bool ff_release(FakeController &controller) {
+  auto player = ff_players().find(controller.slot);
+  bool current = player != ff_players().end() && player->second == &controller;
+  if (current) ff_players().erase(player);
+  controller.playing_ff = -1;
+  return current;
+}
+
 __attribute__((visibility("hidden"))) static void
-check_ff_event(const struct input_event *ev, uint16_t slot) {
+check_ff_event(const struct input_event *ev, FakeController &controller) {
   if (ev->type != EV_FF)
     return;
 
+  uint16_t slot = static_cast<uint16_t>(controller.slot);
   int id = ev->code;
   if (ev->value > 0) {
     auto it = ff_effects().find(id);
     if (it == ff_effects().end())
       return;
     send_ff_effect(it->second, slot);
+    ff_played(controller, id);
   } else {
     send_vibration(0, 0, 0, slot);
+    ff_release(controller);
   }
+}
+
+__attribute__((visibility("hidden"))) static void stop_ff(FakeController &controller) {
+  bool playing = controller.playing_ff >= 0 && controller.owner == getpid();
+  if (ff_release(controller) && playing) send_vibration(0, 0, 0, static_cast<uint16_t>(controller.slot));
 }
 
 __attribute__((visibility("hidden"))) char *
@@ -494,7 +651,7 @@ get_fake_input_rdev(const char *event) {
 
 __attribute__((visibility("hidden"))) static void load_ring_paths() {
   std::lock_guard<std::recursive_mutex> guard(controller_mutex());
-  if (ring_paths_loaded)
+  if (ring_paths_loaded || !env_ready())
     return;
 
   const char *spec = getenv("FAKE_EVDEV_MEMFD_PATHS");
@@ -553,6 +710,19 @@ ring_header_is_valid(const FakeInputRingHeader *ring) {
          ring->version == FAKE_INPUT_RING_VERSION &&
          ring->event_size == FAKE_INPUT_EVENT_SIZE &&
          ring->capacity == FAKE_INPUT_RING_CAPACITY;
+}
+
+__attribute__((visibility("hidden"))) static int ring_wait(const FakeInputRingHeader *ring, uint64_t seen, long ns) {
+  struct timespec wait = {0, ns};
+  if (syscall(SYS_futex, &ring->write_seq, FUTEX_WAIT, static_cast<uint32_t>(seen), &wait, nullptr, 0) == 0 ||
+      errno == EAGAIN || errno == ETIMEDOUT)
+    return 0;
+  if (errno == EINTR) return -1;
+  return nanosleep(&wait, nullptr);
+}
+
+__attribute__((visibility("hidden"))) static void ring_wake(const FakeInputRingHeader *ring) {
+  syscall(SYS_futex, &ring->write_seq, FUTEX_WAKE, INT_MAX, nullptr, nullptr, 0);
 }
 
 struct SnapshotState {
@@ -631,7 +801,7 @@ open_fake_input_ring(const char *event, int flags) {
     return -1;
   }
 
-  static auto my_open = reinterpret_cast<int (*)(const char *, int, ...)>(dlsym(RTLD_NEXT, "open"));
+  const auto my_open = next_symbol<int (*)(const char *, int, ...)>(Next::open);
 
   int fd = my_open(ring_path.c_str(), O_RDWR | (flags & (O_NONBLOCK | O_CLOEXEC)));
   if (fd < 0)
@@ -714,8 +884,21 @@ __attribute__((visibility("hidden"))) static bool is_steam_client() {
 __attribute__((visibility("hidden"))) static bool presents_steam_virtual() {
   static int known;
   if (known == 0) {
+    if (!env_ready()) return false;
     const char *enabled = getenv("FAKE_EVDEV_STEAM_VIRTUAL");
     known = enabled && atoi(enabled) && !is_steam_client() ? 1 : -1;
+  }
+  return known == 1;
+}
+
+// The bionic Proton layer's winebus has no udev bus, and its SDL bus skips 28de:11ff (Proton reads Steam's virtual
+// pad through udev/evdev), so with FAKE_EVDEV_STEAM_PAD_AS_X360=1 other processes see that pad as a plain Xbox 360 pad.
+__attribute__((visibility("hidden"))) static bool steam_pad_as_x360() {
+  static int known;
+  if (known == 0) {
+    if (!env_ready()) return false;
+    const char *v = getenv("FAKE_EVDEV_STEAM_PAD_AS_X360");
+    known = v && atoi(v) && !is_steam_client() ? 1 : -1;
   }
   return known == 1;
 }
@@ -885,7 +1068,7 @@ __attribute__((visibility("hidden"))) static void unpublish_uinput(UinputWriter 
 }
 
 __attribute__((visibility("hidden"))) static int claim_uinput_node(int *fd_out) {
-  static auto my_open = reinterpret_cast<int (*)(const char *, int, ...)>(dlsym(RTLD_NEXT, "open"));
+  const auto my_open = next_symbol<int (*)(const char *, int, ...)>(Next::open);
   for (int node = UINPUT_EVENT_BASE; node < UINPUT_EVENT_LIMIT; node++) {
     std::string path = uinput_ring_path(node);
     int fd = my_open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
@@ -912,7 +1095,7 @@ __attribute__((visibility("hidden"))) static int claim_uinput_node(int *fd_out) 
 }
 
 __attribute__((visibility("hidden"))) static int publish_uinput(UinputWriter &w) {
-  static auto my_open = reinterpret_cast<int (*)(const char *, int, ...)>(dlsym(RTLD_NEXT, "open"));
+  const auto my_open = next_symbol<int (*)(const char *, int, ...)>(Next::open);
   int fd = -1;
   int node = claim_uinput_node(&fd);
   if (node < 0) return -1;
@@ -998,6 +1181,7 @@ __attribute__((visibility("hidden"))) static void flush_uinput(UinputWriter &w) 
   __atomic_thread_fence(__ATOMIC_RELEASE);
   __atomic_store_n(&ring->snapshot_seq, sequence + 2, __ATOMIC_RELEASE);
   __atomic_store_n(&ring->write_seq, write_seq, __ATOMIC_RELEASE);
+  ring_wake(ring);
 }
 
 __attribute__((visibility("hidden"))) static ssize_t
@@ -1185,10 +1369,13 @@ struct DeckImu {
   uint32_t controls;
   uint32_t pad_type;
   uint32_t latency;
+  uint32_t remote_imu_mode;
+  uint32_t remote_imu_pid;
 };
 static_assert(offsetof(DeckImu, pad_type) == FAKE_INPUT_RING_PAD_TYPE_OFFSET,
                 "DeckImu::pad_type matches FakeInputWriter and the ring reader");
 static_assert(offsetof(DeckImu, latency) == 48, "DeckImu::latency matches FakeInputWriter");
+static_assert(offsetof(DeckImu, remote_imu_mode) == 52, "DeckImu::remote_imu_mode matches FakeInputWriter");
 static constexpr uint32_t LATENCY_CONTROLLER = 1, LATENCY_TOUCH = 2;
 static constexpr int LOW_LATENCY_REPORT_INTERVAL_US = 1000;
 static constexpr uint32_t DECK_EXTRA_L4 = 1, DECK_EXTRA_R4 = 2, DECK_EXTRA_L5 = 4,
@@ -1295,6 +1482,7 @@ static std::unordered_map<int, std::shared_ptr<DeckHidraw>> &deck_map() {
 
 static bool fake_deck_enabled() {
   static int enabled = -1;
+  if (enabled < 0 && !env_ready()) return false;
   if (enabled < 0) enabled = getenv("FAKE_EVDEV_DECK") && atoi(getenv("FAKE_EVDEV_DECK")) ? 1 : 0;
   return enabled == 1;
 }
@@ -1302,6 +1490,7 @@ static bool fake_deck_enabled() {
 __attribute__((visibility("hidden"))) static uint32_t session_pad_type() {
   static int type = -1;
   if (type < 0) {
+    if (!env_ready()) return PAD_TYPE_DECK;
     const char *env = getenv("FAKE_EVDEV_PAD_TYPE");
     type = env && !strcmp(env, "steamcontroller") ? PAD_TYPE_STEAM
          : env && !strcmp(env, "xbox360") ? PAD_TYPE_XBOX
@@ -1320,7 +1509,7 @@ __attribute__((visibility("hidden"))) static const uint8_t *ring_blocks() {
   std::lock_guard<std::mutex> guard(lock);
   if ((mapped = block.load(std::memory_order_acquire))) return mapped;
   tries.fetch_add(1, std::memory_order_relaxed);
-  static auto my_open = reinterpret_cast<int (*)(const char *, int, ...)>(dlsym(RTLD_NEXT, "open"));
+  const auto my_open = next_symbol<int (*)(const char *, int, ...)>(Next::open);
   std::string path = get_ring_path_for_slot(0);
   int fd = path.empty() ? -1 : my_open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) return nullptr;
@@ -1366,6 +1555,12 @@ __attribute__((visibility("hidden"))) static void sleep_us(int us) {
   nanosleep(&interval, nullptr);
 }
 
+__attribute__((visibility("hidden"))) static void
+report_wait(const FakeInputRingHeader *ring, bool fresh, uint64_t seen, int us) {
+  if (fresh) ring_wait(ring, seen, us * 1000L);
+  else sleep_us(us);
+}
+
 __attribute__((visibility("hidden"))) static uint64_t monotonic_us() {
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
@@ -1374,6 +1569,7 @@ __attribute__((visibility("hidden"))) static uint64_t monotonic_us() {
 
 static bool fake_triton_enabled() {
   static int enabled = -1;
+  if (enabled < 0 && !env_ready()) return false;
   if (enabled < 0)
     enabled = fake_deck_enabled() && getenv("FAKE_EVDEV_TRITON") && atoi(getenv("FAKE_EVDEV_TRITON")) ? 1 : 0;
   return enabled == 1;
@@ -1391,6 +1587,25 @@ __attribute__((visibility("hidden"))) static bool process_is_steam_client() {
       client = !strcmp(name ? name + 1 : exe, "steam");
     }
     known = client ? 1 : -1;
+  }
+  return known == 1;
+}
+
+// Steam's Remote Play client reads the controller itself, in its own streaming_client process.
+__attribute__((visibility("hidden"))) static bool process_reads_pads() {
+  static int known;
+  if (known == 0) {
+    bool reader = process_is_steam_client();
+    if (!reader) {
+      char exe[PATH_MAX];
+      ssize_t length = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+      if (length > 0) {
+        exe[length] = '\0';
+        const char *name = strrchr(exe, '/');
+        reader = !strcmp(name ? name + 1 : exe, "streaming_client");
+      }
+    }
+    known = reader ? 1 : -1;
   }
   return known == 1;
 }
@@ -1439,7 +1654,7 @@ __attribute__((visibility("hidden"))) static bool is_withdrawn_pad_path(const ch
     free(fake);
     return !exposed;
   }
-  return number == 0 || !process_is_steam_client();
+  return number == 0 || !process_reads_pads();
 }
 
 static bool fake_pad_withdrawn(const FakeController &fake) {
@@ -1518,7 +1733,8 @@ __attribute__((visibility("hidden"))) static void *deck_report_thread(void *arg)
   int32_t axes[8] = {};
   DeckExtras extras;
   while (live_pad_type() == PAD_TYPE_DECK) {
-    if (read_snapshot(self->ring, snap) && snap.generation == ring_generation(self->ring)) {
+    bool fresh = read_snapshot(self->ring, snap);
+    if (fresh && snap.generation == ring_generation(self->ring)) {
       buttons = snap.buttons;
       memcpy(axes, snap.axes, sizeof(axes));
     }
@@ -1528,7 +1744,7 @@ __attribute__((visibility("hidden"))) static void *deck_report_thread(void *arg)
     if (send(self->peer, report, sizeof(report), MSG_DONTWAIT | MSG_NOSIGNAL) < 0 &&
         errno != EAGAIN && errno != EWOULDBLOCK)
       break;
-    sleep_us(controller_report_interval_us(DECK_REPORT_INTERVAL_US));
+    report_wait(self->ring, fresh, snap.write_seq, controller_report_interval_us(DECK_REPORT_INTERVAL_US));
   }
   syscall(SYS_close, self->peer);
   munmap(self->ring, self->mapping_size);
@@ -1634,7 +1850,8 @@ __attribute__((visibility("hidden"))) static void *sony_report_thread(void *arg)
   SonyTouch touch;
   const uint64_t start_us = monotonic_us();
   while (live_pad_type() == type) {
-    if (read_snapshot(self->ring, snap) && snap.generation == ring_generation(self->ring)) {
+    bool fresh = read_snapshot(self->ring, snap);
+    if (fresh && snap.generation == ring_generation(self->ring)) {
       buttons = snap.buttons;
       memcpy(axes, snap.axes, sizeof(axes));
     }
@@ -1644,7 +1861,7 @@ __attribute__((visibility("hidden"))) static void *sony_report_thread(void *arg)
     if (send(self->peer, report, sizeof(report), MSG_DONTWAIT | MSG_NOSIGNAL) < 0 &&
         errno != EAGAIN && errno != EWOULDBLOCK)
       break;
-    sleep_us(controller_report_interval_us(DECK_REPORT_INTERVAL_US));
+    report_wait(self->ring, fresh, snap.write_seq, controller_report_interval_us(DECK_REPORT_INTERVAL_US));
   }
   syscall(SYS_close, self->peer);
   munmap(self->ring, self->mapping_size);
@@ -1653,8 +1870,8 @@ __attribute__((visibility("hidden"))) static void *sony_report_thread(void *arg)
 
 __attribute__((visibility("hidden"))) static int open_deck_hidraw(int flags, uint8_t sony = 0) {
   const char *path = sony == 4 ? DS4_HIDRAW_PATH : sony == 5 ? DUALSENSE_HIDRAW_PATH : DECK_HIDRAW_PATH;
-  static auto my_open = reinterpret_cast<int (*)(const char *, int, ...)>(dlsym(RTLD_NEXT, "open"));
-  if (!process_is_steam_client()) {
+  const auto my_open = next_symbol<int (*)(const char *, int, ...)>(Next::open);
+  if (!process_reads_pads()) {
     Logger::log("deck: %s refused: not the Steam client\n", path);
     errno = ENOENT;
     return -1;
@@ -1843,7 +2060,8 @@ __attribute__((visibility("hidden"))) static void *triton_pad_thread(void *arg) 
   DeckExtras extras;
   const uint64_t start_us = monotonic_us();
   while (live_pad_type() == PAD_TYPE_STEAM) {
-    if (read_snapshot(self->ring, snap) && snap.generation == ring_generation(self->ring)) {
+    bool fresh = read_snapshot(self->ring, snap);
+    if (fresh && snap.generation == ring_generation(self->ring)) {
       buttons = snap.buttons;
       memcpy(axes, snap.axes, sizeof(axes));
     }
@@ -1854,7 +2072,7 @@ __attribute__((visibility("hidden"))) static void *triton_pad_thread(void *arg) 
     if (send(self->peer, report, sizeof(report), MSG_DONTWAIT | MSG_NOSIGNAL) < 0 &&
         errno != EAGAIN && errno != EWOULDBLOCK)
       break;
-    sleep_us(controller_report_interval_us(TRITON_REPORT_INTERVAL_US));
+    report_wait(self->ring, fresh, snap.write_seq, controller_report_interval_us(TRITON_REPORT_INTERVAL_US));
   }
   syscall(SYS_close, self->peer);
   munmap(self->ring, self->mapping_size);
@@ -1862,8 +2080,8 @@ __attribute__((visibility("hidden"))) static void *triton_pad_thread(void *arg) 
 }
 
 __attribute__((visibility("hidden"))) static int open_triton_hidraw(int flags, bool emulated) {
-  static auto my_open = reinterpret_cast<int (*)(const char *, int, ...)>(dlsym(RTLD_NEXT, "open"));
-  if (!process_is_steam_client()) {
+  const auto my_open = next_symbol<int (*)(const char *, int, ...)>(Next::open);
+  if (!process_reads_pads()) {
     errno = ENOENT;
     return -1;
   }
@@ -1976,11 +2194,12 @@ static_assert(sizeof(TouchRingFile) <= TOUCH_RING_SIZE, "TouchRingFile layout");
 
 __attribute__((visibility("hidden"))) static TouchRingFile *touch_ring() {
   static TouchRingFile *ring = nullptr;
+  if (!env_ready()) return nullptr;
   static std::once_flag once;
   std::call_once(once, [] {
     const char *path = getenv("FAKE_TOUCHCTL_RING");
     if (!path || !*path || !fake_deck_enabled()) return;
-    static auto my_open = reinterpret_cast<int (*)(const char *, int, ...)>(dlsym(RTLD_NEXT, "open"));
+    const auto my_open = next_symbol<int (*)(const char *, int, ...)>(Next::open);
     int fd = my_open(path, O_RDWR | O_CLOEXEC);
     if (fd < 0) {
       Logger::log("touch: %s not openable (%s)\n", path, strerror(errno));
@@ -2004,15 +2223,19 @@ __attribute__((visibility("hidden"))) static bool touch_plugged() {
 }
 
 __attribute__((visibility("hidden"))) static bool is_touch_hidraw_path(const char *pathname) {
-  return pathname && !strcmp(pathname, TOUCH_HIDRAW_PATH) && process_is_steam_client() && touch_ring();
+  return pathname && !strcmp(pathname, TOUCH_HIDRAW_PATH) && process_reads_pads() && touch_ring();
 }
+
+static std::mutex touch_state_mutex;
+static int touch_state_lock_fd = -1;
 
 template <typename F>
 __attribute__((visibility("hidden"))) static void touch_state(F &&write) {
   TouchRingFile *ring = touch_ring();
   if (!ring) return;
-  static std::mutex mutex;
-  std::lock_guard<std::mutex> guard(mutex);
+  std::lock_guard<std::mutex> guard(touch_state_mutex);
+  ProcessSlotLock slot(touch_state_lock_fd, "touch-state", 20);
+  if (!slot.may_write()) return;
   __atomic_fetch_add(&ring->state_seq, 1, __ATOMIC_ACQ_REL);
   write(*ring);
   __atomic_fetch_add(&ring->state_seq, 1, __ATOMIC_ACQ_REL);
@@ -2193,7 +2416,8 @@ __attribute__((visibility("hidden"))) static int inject_uevent(const char *actio
                                                                const char *subsystem, const char *devname,
                                                                unsigned major, unsigned minor) {
   using inject_fn = int (*)(const char *, const char *, const char *, const char *, unsigned, unsigned);
-  static auto inject = reinterpret_cast<inject_fn>(dlsym(RTLD_DEFAULT, "bl_udevmon_inject"));
+  static SymbolSlot inject_slot;
+  const auto inject = resolved_symbol<inject_fn>(inject_slot, RTLD_DEFAULT, "dd_udevmon_inject");
   return inject ? inject(action, devpath, subsystem, devname, major, minor) : -1;
 }
 
@@ -2264,9 +2488,10 @@ __attribute__((visibility("hidden"))) static void *pad_type_thread(void *) {
     struct timespec settle = {0, 300 * 1000 * 1000};
     nanosleep(&settle, nullptr);
     int added = pad_type_uevent(now, "add");
-    if (was != PAD_TYPE_XBOX) poke_hidraw_watchers(pad_type_minor(was));
-    if (now != PAD_TYPE_XBOX) poke_hidraw_watchers(pad_type_minor(now));
-    if (was == PAD_TYPE_XBOX || now == PAD_TYPE_XBOX) {
+    bool shared = process_is_steam_client();
+    if (shared && was != PAD_TYPE_XBOX) poke_hidraw_watchers(pad_type_minor(was));
+    if (shared && now != PAD_TYPE_XBOX) poke_hidraw_watchers(pad_type_minor(now));
+    if (shared && (was == PAD_TYPE_XBOX || now == PAD_TYPE_XBOX)) {
       std::string node = std::string(fake_hook_dir()) + "/event0";
       std::string aside = std::string(fake_hook_dir()) + "/.event0-switching";
       if (rename(node.c_str(), aside.c_str()) == 0) {
@@ -2285,7 +2510,7 @@ __attribute__((visibility("hidden"))) static void *pad_type_thread(void *) {
 
 __attribute__((constructor)) static void start_pad_type_watch() {
   config();
-  if (!process_is_steam_client() || !fake_deck_enabled()) return;
+  if (!process_reads_pads() || !fake_deck_enabled()) return;
   pthread_t thread;
   if (pthread_create(&thread, nullptr, pad_type_thread, nullptr) == 0) pthread_detach(thread);
 }
@@ -2306,7 +2531,7 @@ __attribute__((visibility("hidden"))) static void *touch_plug_thread(void *) {
 
 __attribute__((constructor)) static void start_touch_controller() {
   config();
-  if (!process_is_steam_client() || !touch_ring()) return;
+  if (!process_reads_pads() || !touch_ring()) return;
   pthread_t thread;
   if (pthread_create(&thread, nullptr, touch_plug_thread, nullptr) == 0) pthread_detach(thread);
 }
@@ -2314,6 +2539,7 @@ __attribute__((constructor)) static void start_touch_controller() {
 static constexpr long SYSFS_FS_MAGIC = 0x62656572;
 
 __attribute__((visibility("hidden"))) static const char *deck_listing_dir() {
+  if (!env_ready()) return nullptr;
   static const char *dir = getenv("FAKE_DECK_SYSFS_LISTING");
   return dir && *dir ? dir : nullptr;
 }
@@ -2322,7 +2548,15 @@ __attribute__((visibility("hidden"))) static bool is_deck_sysfs_path(const char 
   if (!path) return false;
   if (!strncmp(path, "/sys/devices/droiddeck", 22) || !strncmp(path, "/sys/class/hidraw", 17)) return true;
   const char *listing = deck_listing_dir();
-  return listing && !strncmp(path, listing, strlen(listing));
+  if (!listing) return false;
+  if (!strncmp(path, listing, strlen(listing))) return true;
+  // Without proot, a descriptor's /proc/self/fd link names the stand-in where it really is (the
+  // listing's parent holds devices/ and class-hidraw/), not /sys
+  const char *slash = strrchr(listing, '/');
+  if (!slash || slash == listing) return false;
+  size_t root = static_cast<size_t>(slash - listing);
+  return !strncmp(path, listing, root) && path[root] == '/' &&
+         (!strncmp(path + root, "/devices", 8) || !strncmp(path + root, "/class-hidraw", 13));
 }
 
 __attribute__((visibility("hidden"))) static bool is_deck_sysfs_fd(int fd) {
@@ -2341,7 +2575,7 @@ __attribute__((visibility("hidden"))) static void note_deck_sysfs(const char *ho
 }
 
 EXPORT int fstatfs(int fd, struct statfs *buf) {
-  static auto real = reinterpret_cast<int (*)(int, struct statfs *)>(dlsym(RTLD_NEXT, "fstatfs"));
+  const auto real = next_symbol<int (*)(int, struct statfs *)>(Next::fstatfs);
   int result = real(fd, buf);
   if (fake_deck_enabled() && is_deck_sysfs_fd(fd)) {
     note_deck_sysfs("fstatfs", result);
@@ -2351,7 +2585,7 @@ EXPORT int fstatfs(int fd, struct statfs *buf) {
 }
 
 EXPORT int statfs(const char *path, struct statfs *buf) {
-  static auto real = reinterpret_cast<int (*)(const char *, struct statfs *)>(dlsym(RTLD_NEXT, "statfs"));
+  const auto real = next_symbol<int (*)(const char *, struct statfs *)>(Next::statfs);
   int result = real(path, buf);
   if (fake_deck_enabled() && is_deck_sysfs_path(path)) {
     note_deck_sysfs(path, result);
@@ -2400,13 +2634,18 @@ __attribute__((visibility("hidden"))) static int deck_imu_mode_change(const uint
 }
 
 __attribute__((visibility("hidden"))) static void publish_imu_mode(const DeckHidraw &deck, int mode) {
-  static auto my_open = reinterpret_cast<int (*)(const char *, int, ...)>(dlsym(RTLD_NEXT, "open"));
+  const auto my_open = next_symbol<int (*)(const char *, int, ...)>(Next::open);
   if (deck.mapping_size < FAKE_INPUT_RING_SIZE + DECK_IMU_BLOCK_SIZE) return;
   std::string path = get_ring_path_for_slot(0);
   int fd = path.empty() ? -1 : my_open(path.c_str(), O_WRONLY | O_CLOEXEC);
   if (fd < 0) return;
-  uint32_t value = 0x80000000u | static_cast<uint32_t>(mode);
-  if (pwrite(fd, &value, sizeof(value), FAKE_INPUT_RING_SIZE + offsetof(DeckImu, imu_mode)) != sizeof(value))
+  // Steam and its Remote Play client each keep their own word, so one turning motion off does not starve the
+  // other; Android reads motion while either wants it. The pid lets it ignore a Remote Play client that has gone.
+  uint32_t value[2] = {0x80000000u | static_cast<uint32_t>(mode), static_cast<uint32_t>(getpid())};
+  bool steam = process_is_steam_client();
+  size_t length = steam ? sizeof(value[0]) : sizeof(value);
+  off_t offset = FAKE_INPUT_RING_SIZE + (steam ? offsetof(DeckImu, imu_mode) : offsetof(DeckImu, remote_imu_mode));
+  if (pwrite(fd, value, length, offset) != static_cast<ssize_t>(length))
     Logger::log("deck: imu mode not published (%s)\n", strerror(errno));
   syscall(SYS_close, fd);
 }
@@ -2611,7 +2850,10 @@ __attribute__((visibility("hidden"))) static void triton_queue_output(DeckHidraw
   auto *shared = reinterpret_cast<TritonSharedData *>(reinterpret_cast<uint8_t *>(triton.ring) + TRITON_SHARED_OFFSET);
   if (__atomic_load_n(&shared->magic, __ATOMIC_ACQUIRE) != TRITON_SHARED_MAGIC) return;
   static std::mutex one_at_a_time;
+  static int lock_fd = -1;
   std::lock_guard<std::mutex> guard(one_at_a_time);
+  ProcessSlotLock slot(lock_fd, "triton-output", TRITON_OUTPUT_TIMEOUT_MS * 2);
+  if (!slot.may_write()) return;
   for (int waited = 0;
        static_cast<uint32_t>(__atomic_load_n(&shared->output_seq, __ATOMIC_ACQUIRE)) !=
            __atomic_load_n(&shared->output_ack, __ATOMIC_ACQUIRE) &&
@@ -2643,7 +2885,13 @@ __attribute__((visibility("hidden"))) static int triton_get_feature(DeckHidraw &
   }
   auto *shared = reinterpret_cast<TritonSharedData *>(reinterpret_cast<uint8_t *>(triton.ring) + TRITON_SHARED_OFFSET);
   static std::mutex one_at_a_time;
+  static int lock_fd = -1;
   std::lock_guard<std::mutex> guard(one_at_a_time);
+  ProcessSlotLock slot(lock_fd, "triton-feature", TRITON_FEATURE_TIMEOUT_MS);
+  if (!slot.may_write()) {
+    errno = EIO;
+    return -1;
+  }
   uint8_t report_id = report[0];
   __atomic_store_n(&shared->get_report_id, report_id, __ATOMIC_RELAXED);
   uint64_t request = __atomic_add_fetch(&shared->get_request, 1, __ATOMIC_RELEASE);
@@ -2831,7 +3079,7 @@ __attribute__((visibility("hidden"))) static int ioctl_triton(DeckHidraw &triton
 __attribute__((visibility("hidden"))) static std::string note_sys_failure(int dirfd, const char *pathname) {
   int saved_errno = errno;
   std::string path;
-  if (saved_errno == ENOENT || !pathname || !process_is_steam_client()) {
+  if (saved_errno == ENOENT || !pathname || !process_reads_pads()) {
     errno = saved_errno;
     return path;
   }
@@ -2870,7 +3118,7 @@ __attribute__((visibility("hidden"))) static std::string note_sys_failure(int di
 
 __attribute__((visibility("hidden"))) static std::string deck_listing_for(const char *path) {
   const char *listing = deck_listing_dir();
-  if (!path || !listing || errno != EACCES || !fake_deck_enabled() || !process_is_steam_client()) return {};
+  if (!path || !listing || errno != EACCES || !fake_deck_enabled() || !process_reads_pads()) return {};
   std::string p(path);
   while (p.size() > 1 && p.back() == '/') p.pop_back();
   int which = p == "/sys" ? 0 : p == "/sys/class" ? 1 : p == "/sys/bus" ? 2 : -1;
@@ -2895,7 +3143,7 @@ static int real_fstat(int fd, struct stat *buf);
 
 __attribute__((visibility("hidden"))) static bool deck_mount_id_from_fdinfo(
     int dirfd, const char *path, int flags, struct statx *buf) {
-  static auto real_openat = reinterpret_cast<decltype(&::openat)>(dlsym(RTLD_NEXT, "openat"));
+  const auto real_openat = next_symbol<decltype(&::openat)>(Next::openat);
   int target;
   if (!path || !*path) {
     if (!(flags & AT_EMPTY_PATH)) return false;
@@ -2933,13 +3181,13 @@ __attribute__((visibility("hidden"))) static bool deck_mount_id_from_fdinfo(
 }
 
 EXPORT int statx(int dirfd, const char *path, int flags, unsigned mask, struct statx *buf) {
-  static auto real = reinterpret_cast<decltype(&::statx)>(dlsym(RTLD_NEXT, "statx"));
+  const auto real = next_symbol<decltype(&::statx)>(Next::statx);
   int result = real(dirfd, path, flags, mask, buf);
   int saved_errno = errno;
   constexpr unsigned unique_mount_id = 0x4000;
   if (result == 0 && (mask & STATX_MNT_ID) &&
       !(buf->stx_mask & (STATX_MNT_ID | unique_mount_id)) && fake_deck_enabled() &&
-      process_is_steam_client() && deck_device_library(__builtin_return_address(0))) {
+      process_reads_pads() && deck_device_library(__builtin_return_address(0))) {
     bool recovered = deck_mount_id_from_fdinfo(dirfd, path, flags, buf);
     static std::atomic<bool> noted_success{false}, noted_failure{false};
     if (!(recovered ? noted_success : noted_failure).exchange(true))
@@ -2954,7 +3202,7 @@ EXPORT int statx(int dirfd, const char *path, int flags, unsigned mask, struct s
 #endif
 
 EXPORT DIR *opendir(const char *name) {
-  static auto real = reinterpret_cast<DIR *(*)(const char *)>(dlsym(RTLD_NEXT, "opendir"));
+  const auto real = next_symbol<DIR *(*)(const char *)>(Next::opendir);
   DIR *dir = real(name);
   if (!dir) {
     note_sys_failure(AT_FDCWD, name);
@@ -2984,7 +3232,7 @@ EXPORT int open(const char *pathname, int flags, ...) {
 
   va_end(va);
 
-  static auto my_open = reinterpret_cast<int (*)(const char *, int, ...)>(dlsym(RTLD_NEXT, "open"));
+  const auto my_open = next_symbol<int (*)(const char *, int, ...)>(Next::open);
 
   if (fake_uinput_enabled() && is_uinput_path(pathname)) return open_uinput(flags);
   if (is_deck_hidraw_path(pathname)) return open_deck_hidraw(flags);
@@ -3062,7 +3310,7 @@ EXPORT int openat(int dirfd, const char *pathname, int flags, ...) {
 
   va_end(va);
 
-  static auto my_openat = reinterpret_cast<int (*)(int, const char *, int, ...)>(dlsym(RTLD_NEXT, "openat"));
+  const auto my_openat = next_symbol<int (*)(int, const char *, int, ...)>(Next::openat);
 
   if (fake_uinput_enabled() && is_uinput_path(pathname)) return open_uinput(flags);
   if (is_deck_hidraw_path(pathname)) return open_deck_hidraw(flags);
@@ -3128,7 +3376,7 @@ template <typename S, typename Real>
 static int fake_stat_path(const char *pathname, S *statbuf, Real real) {
   if (is_withdrawn_pad_path(pathname) ||
       ((is_deck_hidraw_path(pathname) || is_triton_hidraw_path(pathname) || is_triton_pad_path(pathname) ||
-        sony_pad_path(pathname)) && !process_is_steam_client())) {
+        sony_pad_path(pathname)) && !process_reads_pads())) {
     errno = ENOENT;
     return -1;
   }
@@ -3221,10 +3469,10 @@ static int fake_stat_fd(int fd, S *buf, Real real) {
 }
 
 static int real_stat(const char *pathname, struct stat *statbuf) {
-  static auto fn = reinterpret_cast<int (*)(const char *, struct stat *)>(dlsym(RTLD_NEXT, "stat"));
+  const auto fn = next_symbol<int (*)(const char *, struct stat *)>(Next::stat);
   if (fn) return fn(pathname, statbuf);
 #ifdef _STAT_VER
-  static auto xfn = reinterpret_cast<int (*)(int, const char *, struct stat *)>(dlsym(RTLD_NEXT, "__xstat"));
+  const auto xfn = next_symbol<int (*)(int, const char *, struct stat *)>(Next::xstat);
   if (xfn) return xfn(_STAT_VER, pathname, statbuf);
 #endif
   errno = ENOSYS;
@@ -3232,10 +3480,10 @@ static int real_stat(const char *pathname, struct stat *statbuf) {
 }
 
 static int real_fstat(int fd, struct stat *buf) {
-  static auto fn = reinterpret_cast<int (*)(int, struct stat *)>(dlsym(RTLD_NEXT, "fstat"));
+  const auto fn = next_symbol<int (*)(int, struct stat *)>(Next::fstat);
   if (fn) return fn(fd, buf);
 #ifdef _STAT_VER
-  static auto xfn = reinterpret_cast<int (*)(int, int, struct stat *)>(dlsym(RTLD_NEXT, "__fxstat"));
+  const auto xfn = next_symbol<int (*)(int, int, struct stat *)>(Next::fxstat);
   if (xfn) return xfn(_STAT_VER, fd, buf);
 #endif
   errno = ENOSYS;
@@ -3251,11 +3499,11 @@ EXPORT int fstat(int fd, struct stat *buf) {
 }
 
 EXPORT int access(const char *pathname, int mode) {
-  static auto my_access = reinterpret_cast<decltype(&::access)>(dlsym(RTLD_NEXT, "access"));
+  const auto my_access = next_symbol<decltype(&::access)>(Next::access);
   if (fake_uinput_enabled() && is_uinput_path(pathname)) return 0;
-  if (is_deck_hidraw_path(pathname) && process_is_steam_client()) return 0;
+  if (is_deck_hidraw_path(pathname) && process_reads_pads()) return 0;
   if ((is_triton_hidraw_path(pathname) || is_triton_pad_path(pathname) || sony_pad_path(pathname)) &&
-      process_is_steam_client())
+      process_reads_pads())
     return 0;
   if (is_touch_hidraw_path(pathname)) return 0;
   if (is_withdrawn_pad_path(pathname) || is_deck_hidraw_path(pathname) || is_triton_hidraw_path(pathname) ||
@@ -3292,11 +3540,11 @@ EXPORT int access(const char *pathname, int mode) {
 }
 
 EXPORT int faccessat(int dirfd, const char *pathname, int mode, int flags) {
-  static auto my_faccessat = reinterpret_cast<decltype(&::faccessat)>(dlsym(RTLD_NEXT, "faccessat"));
+  const auto my_faccessat = next_symbol<decltype(&::faccessat)>(Next::faccessat);
   if (fake_uinput_enabled() && is_uinput_path(pathname)) return 0;
-  if (is_deck_hidraw_path(pathname) && process_is_steam_client()) return 0;
+  if (is_deck_hidraw_path(pathname) && process_reads_pads()) return 0;
   if ((is_triton_hidraw_path(pathname) || is_triton_pad_path(pathname) || sony_pad_path(pathname)) &&
-      process_is_steam_client())
+      process_reads_pads())
     return 0;
   if (is_touch_hidraw_path(pathname)) return 0;
   if (is_withdrawn_pad_path(pathname) || is_deck_hidraw_path(pathname) || is_triton_hidraw_path(pathname) ||
@@ -3336,7 +3584,7 @@ EXPORT int scandir(const char *dirp, struct dirent ***namelist,
                    int (*filter)(const struct dirent *),
                    int (*compar)(const struct dirent **,
                                  const struct dirent **)) {
-  static auto my_scandir = reinterpret_cast<decltype(&::scandir)>(dlsym(RTLD_NEXT, "scandir"));
+  const auto my_scandir = next_symbol<decltype(&::scandir)>(Next::scandir);
 
   if (dirp) {
     if (!strcmp(dirp, "/dev/input")) {
@@ -3350,7 +3598,7 @@ EXPORT int scandir(const char *dirp, struct dirent ***namelist,
 }
 
 EXPORT int inotify_add_watch(int fd, const char *pathname, uint32_t mask) {
-  static auto my_inotify_add_watch = reinterpret_cast<decltype(&::inotify_add_watch)>(dlsym(RTLD_NEXT, "inotify_add_watch"));
+  const auto my_inotify_add_watch = next_symbol<decltype(&::inotify_add_watch)>(Next::inotify_add_watch);
 
   char *fake_path = nullptr;
   if (pathname) {
@@ -3363,7 +3611,7 @@ EXPORT int inotify_add_watch(int fd, const char *pathname, uint32_t mask) {
       pathname = fake_path;
     } else if (!strcmp(pathname, "/dev/input")) {
       pathname = fake_hook_dir();
-    } else if (!strcmp(pathname, "/dev") && fake_deck_enabled() && process_is_steam_client()) {
+    } else if (!strcmp(pathname, "/dev") && fake_deck_enabled() && process_reads_pads()) {
       std::string events = hidraw_event_dir();
       mkdir(events.c_str(), 0700);
       my_inotify_add_watch(fd, events.c_str(), mask);
@@ -3489,7 +3737,7 @@ static bool wait_snapshot(std::shared_ptr<FakeController> fake,
 
 static int forward_ioctl(int fd, ioctl_request_t op, void *argp) {
   using ioctl_fn = int (*)(int, ioctl_request_t, ...);
-  static const auto next = reinterpret_cast<ioctl_fn>(dlsym(RTLD_NEXT, "ioctl"));
+  const auto next = next_symbol<ioctl_fn>(Next::ioctl);
   return next ? next(fd, op, argp) : static_cast<int>(syscall(SYS_ioctl, fd, op, argp));
 }
 
@@ -3547,6 +3795,10 @@ EXPORT int ioctl(int fd, ioctl_request_t op, ...) {
     id.bustype = 0x03;
     if (made) {
       id = made->id;
+      if (steam_pad_as_x360() && id.vendor == STEAM_VIRTUAL_VENDOR_ID && id.product == STEAM_VIRTUAL_PRODUCT_ID) {
+        id.vendor = X360_VENDOR_ID;
+        id.product = X360_PRODUCT_ID;
+      }
     } else if (presents_steam_virtual()) {
       id.vendor = STEAM_VIRTUAL_VENDOR_ID;
       id.product = STEAM_VIRTUAL_PRODUCT_ID;
@@ -3649,10 +3901,12 @@ EXPORT int ioctl(int fd, ioctl_request_t op, ...) {
       effect->id = next_ff_id++;
     ff_effects()[effect->id] = *effect;
     send_ff_effect(*effect, static_cast<uint16_t>(event_number));
+    ff_played(*controller->second, effect->id);
     return 0;
   } else if (type == 0x45 && number == 0x81) {
     int id = (intptr_t)argp;
     ff_effects().erase(id);
+    if (controller->second->playing_ff == id) stop_ff(*controller->second);
     return 0;
   } else if (type == 0x45 && number == 0x84) {
     int max_effects = 16;
@@ -3722,7 +3976,7 @@ EXPORT int ioctl(int fd, ioctl_request_t op, ...) {
 }
 
 EXPORT int close(int fd) {
-  static auto my_close = reinterpret_cast<decltype(&::close)>(dlsym(RTLD_NEXT, "close"));
+  const auto my_close = next_symbol<decltype(&::close)>(Next::close);
 
   if (!watched(fd)) return my_close(fd);
   close_uinput(fd);
@@ -3732,6 +3986,7 @@ EXPORT int close(int fd) {
   if (controller != controller_map().end()) {
     Logger::log("Removing controller, fd %d event %s\n", controller->first,
                 controller->second->event ? controller->second->event : "(unknown)");
+    stop_ff(*controller->second);
     controller->second->closed = true;
     controller_map().erase(fd);
   }
@@ -3785,6 +4040,7 @@ static ssize_t read_input(int fd, void *buf, size_t count) {
       errno = ENODEV;
       return -1;
     }
+    bool idle = false;
     for (int attempt = 0; attempt < 8; ++attempt) {
       size_t requested = count / sizeof(struct input_event);
       if (fake.keyframe_remaining == 0) {
@@ -3806,7 +4062,10 @@ static ssize_t read_input(int fd, void *buf, size_t count) {
           capture_keyframe(fake, snap);
         } else {
           size_t events = std::min<uint64_t>(requested, snap.write_seq - fake.read_seq);
-          if (events == 0) break;
+          if (events == 0) {
+            idle = true;
+            break;
+          }
           const uint8_t *ring_events = reinterpret_cast<const uint8_t *>(fake.ring) +
                                        FAKE_INPUT_RING_HEADER_SIZE;
           std::vector<struct input_event> input_events(events);
@@ -3852,9 +4111,14 @@ static ssize_t read_input(int fd, void *buf, size_t count) {
       errno = EAGAIN;
       return -1;
     }
+    const FakeInputRingHeader *ring = fake.ring;
+    uint64_t seen = fake.read_seq;
     guard.unlock();
+#ifdef __GLIBC__
+    pthread_testcancel();
+#endif
     struct timespec sleep_time = {0, backoff_ns};
-    int result = nanosleep(&sleep_time, nullptr);
+    int result = idle ? ring_wait(ring, seen, backoff_ns) : nanosleep(&sleep_time, nullptr);
     guard.lock();
     if (result < 0) return -1;
     if (low_latency(LATENCY_CONTROLLER)) backoff_ns = kLowLatencyRingWaitUs * 1000;
@@ -3909,7 +4173,7 @@ EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt) {
 }
 
 EXPORT ssize_t write(int fd, const void *buf, size_t count) {
-  static auto my_write = reinterpret_cast<decltype(&::write)>(dlsym(RTLD_NEXT, "write"));
+  const auto my_write = next_symbol<decltype(&::write)>(Next::write);
 
   if (!watched(fd)) return my_write(fd, buf, count);
   std::unique_lock<std::recursive_mutex> guard(controller_mutex());
@@ -3929,12 +4193,8 @@ EXPORT ssize_t write(int fd, const void *buf, size_t count) {
       return -1;
     }
 
-    const struct input_event *ev = nullptr;
-    uint16_t slot = static_cast<uint16_t>(controller->second->slot);
-    if (count == sizeof(struct input_event)) {
-      ev = static_cast<const struct input_event *>(buf);
-      check_ff_event(ev, slot);
-    }
+    if (count == sizeof(struct input_event))
+      check_ff_event(static_cast<const struct input_event *>(buf), *controller->second);
 
     return static_cast<ssize_t>(count);
   }
@@ -3974,14 +4234,10 @@ EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
       return -1;
     }
 
-    uint16_t slot = static_cast<uint16_t>(controller->second->slot);
     ssize_t total = 0;
     for (int i = 0; i < iovcnt; i++) {
-      if (iov[i].iov_len == sizeof(struct input_event)) {
-        const struct input_event *ev =
-            static_cast<const struct input_event *>(iov[i].iov_base);
-        check_ff_event(ev, slot);
-      }
+      if (iov[i].iov_len == sizeof(struct input_event))
+        check_ff_event(static_cast<const struct input_event *>(iov[i].iov_base), *controller->second);
       total += static_cast<ssize_t>(iov[i].iov_len);
     }
     return total;
@@ -3992,8 +4248,8 @@ EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
 
 static int poll_fake(struct pollfd *fds, nfds_t nfds, int timeout,
                      const sigset_t *sigmask) {
-  static auto my_poll = reinterpret_cast<decltype(&::poll)>(dlsym(RTLD_NEXT, "poll"));
-  static auto my_ppoll = reinterpret_cast<decltype(&::ppoll)>(dlsym(RTLD_NEXT, "ppoll"));
+  const auto my_poll = next_symbol<decltype(&::poll)>(Next::poll);
+  const auto my_ppoll = next_symbol<decltype(&::ppoll)>(Next::ppoll);
 
   nfds_t first = 0;
   while (first < nfds && !watched(fds[first].fd)) first++;
@@ -4097,7 +4353,7 @@ EXPORT int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
 
 EXPORT int ppoll(struct pollfd *fds, nfds_t nfds,
                  const struct timespec *timeout, const sigset_t *sigmask) {
-  static auto my_ppoll = reinterpret_cast<decltype(&::ppoll)>(dlsym(RTLD_NEXT, "ppoll"));
+  const auto my_ppoll = next_symbol<decltype(&::ppoll)>(Next::ppoll);
   if (timeout && (timeout->tv_sec < 0 || timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000L)) {
     errno = EINVAL;
     return -1;
@@ -4124,7 +4380,7 @@ EXPORT int ppoll(struct pollfd *fds, nfds_t nfds,
 
 EXPORT int select(int nfds, fd_set *readfds, fd_set *writefds,
                   fd_set *exceptfds, struct timeval *timeout) {
-  static auto my_select = reinterpret_cast<decltype(&::select)>(dlsym(RTLD_NEXT, "select"));
+  const auto my_select = next_symbol<decltype(&::select)>(Next::select);
 
   fd_set original_readfds;
   fd_set original_writefds;
@@ -4286,10 +4542,10 @@ EXPORT int openat64(int dirfd, const char *pathname, int flags, ...) {
 }
 
 static int real_stat64(const char *pathname, struct stat64 *statbuf) {
-  static auto fn = reinterpret_cast<int (*)(const char *, struct stat64 *)>(dlsym(RTLD_NEXT, "stat64"));
+  const auto fn = next_symbol<int (*)(const char *, struct stat64 *)>(Next::stat64);
   if (fn) return fn(pathname, statbuf);
 #ifdef _STAT_VER
-  static auto xfn = reinterpret_cast<int (*)(int, const char *, struct stat64 *)>(dlsym(RTLD_NEXT, "__xstat64"));
+  const auto xfn = next_symbol<int (*)(int, const char *, struct stat64 *)>(Next::xstat64);
   if (xfn) return xfn(_STAT_VER, pathname, statbuf);
 #endif
   errno = ENOSYS;
@@ -4297,10 +4553,10 @@ static int real_stat64(const char *pathname, struct stat64 *statbuf) {
 }
 
 static int real_fstat64(int fd, struct stat64 *buf) {
-  static auto fn = reinterpret_cast<int (*)(int, struct stat64 *)>(dlsym(RTLD_NEXT, "fstat64"));
+  const auto fn = next_symbol<int (*)(int, struct stat64 *)>(Next::fstat64);
   if (fn) return fn(fd, buf);
 #ifdef _STAT_VER
-  static auto xfn = reinterpret_cast<int (*)(int, int, struct stat64 *)>(dlsym(RTLD_NEXT, "__fxstat64"));
+  const auto xfn = next_symbol<int (*)(int, int, struct stat64 *)>(Next::fxstat64);
   if (xfn) return xfn(_STAT_VER, fd, buf);
 #endif
   errno = ENOSYS;
@@ -4316,27 +4572,27 @@ EXPORT int fstat64(int fd, struct stat64 *buf) {
 }
 
 EXPORT int __xstat(int version, const char *pathname, struct stat *statbuf) {
-  static auto real = reinterpret_cast<int (*)(int, const char *, struct stat *)>(dlsym(RTLD_NEXT, "__xstat"));
+  const auto real = next_symbol<int (*)(int, const char *, struct stat *)>(Next::xstat);
   if (!real) return stat(pathname, statbuf);
-  return fake_stat_path(pathname, statbuf, [version](const char *path, struct stat *buf) { return real(version, path, buf); });
+  return fake_stat_path(pathname, statbuf, [version, real](const char *path, struct stat *buf) { return real(version, path, buf); });
 }
 
 EXPORT int __xstat64(int version, const char *pathname, struct stat64 *statbuf) {
-  static auto real = reinterpret_cast<int (*)(int, const char *, struct stat64 *)>(dlsym(RTLD_NEXT, "__xstat64"));
+  const auto real = next_symbol<int (*)(int, const char *, struct stat64 *)>(Next::xstat64);
   if (!real) return stat64(pathname, statbuf);
-  return fake_stat_path(pathname, statbuf, [version](const char *path, struct stat64 *buf) { return real(version, path, buf); });
+  return fake_stat_path(pathname, statbuf, [version, real](const char *path, struct stat64 *buf) { return real(version, path, buf); });
 }
 
 EXPORT int __fxstat(int version, int fd, struct stat *buf) {
-  static auto real = reinterpret_cast<int (*)(int, int, struct stat *)>(dlsym(RTLD_NEXT, "__fxstat"));
+  const auto real = next_symbol<int (*)(int, int, struct stat *)>(Next::fxstat);
   if (!real) return fstat(fd, buf);
-  return fake_stat_fd(fd, buf, [version](int f, struct stat *b) { return real(version, f, b); });
+  return fake_stat_fd(fd, buf, [version, real](int f, struct stat *b) { return real(version, f, b); });
 }
 
 EXPORT int __fxstat64(int version, int fd, struct stat64 *buf) {
-  static auto real = reinterpret_cast<int (*)(int, int, struct stat64 *)>(dlsym(RTLD_NEXT, "__fxstat64"));
+  const auto real = next_symbol<int (*)(int, int, struct stat64 *)>(Next::fxstat64);
   if (!real) return fstat64(fd, buf);
-  return fake_stat_fd(fd, buf, [version](int f, struct stat64 *b) { return real(version, f, b); });
+  return fake_stat_fd(fd, buf, [version, real](int f, struct stat64 *b) { return real(version, f, b); });
 }
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -4350,18 +4606,37 @@ static const char *const interposed_names[] = {
 };
 
 static dlsym_fn next_dlsym() {
-  static const dlsym_fn fn = [] {
+  static std::atomic<dlsym_fn> fn{nullptr};
+  static std::atomic<bool> resolved{false};
+  if (!resolved.load(std::memory_order_acquire)) {
 #ifdef __x86_64__
     const char *base = "GLIBC_2.2.5";
 #else
     const char *base = "GLIBC_2.0";
 #endif
+    dlsym_fn found{};
     for (const char *version : {base, "GLIBC_2.34"}) {
-      if (auto found = reinterpret_cast<dlsym_fn>(dlvsym(RTLD_NEXT, "dlsym", version))) return found;
+      if ((found = reinterpret_cast<dlsym_fn>(dlvsym(RTLD_NEXT, "dlsym", version)))) break;
     }
-    return dlsym_fn{};
-  }();
-  return fn;
+    fn.store(found, std::memory_order_relaxed);
+    resolved.store(true, std::memory_order_release);
+  }
+  return fn.load(std::memory_order_relaxed);
+}
+
+static void *libc_handle() {
+  static std::atomic<void *> handle{nullptr};
+  static std::atomic<bool> resolved{false};
+  if (!resolved.load(std::memory_order_acquire)) {
+    handle.store(dlopen(LIBC_SO, RTLD_LAZY | RTLD_NOLOAD), std::memory_order_relaxed);
+    resolved.store(true, std::memory_order_release);
+  }
+  return handle.load(std::memory_order_relaxed);
+}
+
+__attribute__((constructor)) static void resolve_dlsym_targets() {
+  next_dlsym();
+  libc_handle();
 }
 
 static void *global_dlsym(void *, const char *name) { return next_dlsym()(RTLD_DEFAULT, name); }
@@ -4379,8 +4654,7 @@ extern "C" __attribute__((visibility("hidden"), used)) void *fakeinput_dlsym_tar
   dlsym_fn next = next_dlsym();
   if (!next) return reinterpret_cast<void *>(missing_dlsym);
   if (handle == RTLD_DEFAULT || handle == RTLD_NEXT || name == nullptr) return reinterpret_cast<void *>(next);
-  static void *const libc = dlopen(LIBC_SO, RTLD_LAZY | RTLD_NOLOAD);
-  if (handle != libc || !interposed(name)) return reinterpret_cast<void *>(next);
+  if (handle != libc_handle() || !interposed(name)) return reinterpret_cast<void *>(next);
   return reinterpret_cast<void *>(global_dlsym);
 }
 

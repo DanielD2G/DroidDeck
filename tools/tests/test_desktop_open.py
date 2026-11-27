@@ -67,7 +67,7 @@ class PlacementTest(Temp):
         patcher = mock.patch.dict(OPEN, {"GPU": str(self.gpu), "unattended": lambda env: False})
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.desktop = {"BL_DESKTOP": "1"}
+        self.desktop = {"DD_DESKTOP": "1"}
 
     def placed(self, what, mode, env=None):
         return OPEN["placed"](["cmd"], what, mode, self.desktop if env is None else env)
@@ -110,7 +110,7 @@ class UnattendedTest(Temp):
 
     def test_only_output_nobody_reads_counts(self):
         log = self.write("session/desktop.log", b"")
-        env = {"BL_DEBUG_DIR": str(log.parent)}
+        env = {"DD_DEBUG_DIR": str(log.parent)}
         self.assertTrue(self.with_stdout(os.devnull, env))
         self.assertTrue(self.with_stdout(str(log), env))
         self.assertFalse(self.with_stdout(str(self.tmp / "out.txt"), env))
@@ -135,6 +135,30 @@ class CommandTest(Temp):
         self.assertEqual(OPEN["command"](script, ["1"], "script")[0], ["/bin/sh", script, "1"])
         self.assertEqual(OPEN["command"](script, [], "x86 script")[0],
                          [OPEN["FEX"], "run", "--mode", "on", "--for", str(self.tmp), "--", "/bin/sh", script])
+
+    def test_a_store_games_exe_runs_through_its_launcher(self):
+        exe, launcher = str(self.tmp / "game.exe"), str(self.tmp / "launch.bat")
+        with mock.patch.dict(OPEN, {"store_launcher": lambda path: launcher if path == exe else None,
+                                    "exe_prefix": lambda path: ["--prefix", "4242", "--compatdata", "/c/4242"]}):
+            keep = ["--prefix", "4242", "--compatdata", "/c/4242"]
+            self.assertEqual(OPEN["command"](exe, [], "windows")[0], [OPEN["PROTON_RUN"]] + keep + [launcher])
+            self.assertEqual(OPEN["command"](exe, [], "windows", True)[0],
+                             [OPEN["PROTON_RUN"], "--window"] + keep + [launcher])
+            self.assertEqual(OPEN["command"](exe, ["-x"], "windows")[0], [OPEN["PROTON_RUN"], exe, "-x"])
+            other = str(self.tmp / "other.exe")
+            self.assertEqual(OPEN["command"](other, [], "windows")[0], [OPEN["PROTON_RUN"], other])
+
+    def test_a_store_games_launcher_keeps_the_exes_prefix(self):
+        exe = self.tmp / "game.exe"
+        exe.write_text("x")
+        root = str(self.tmp / "steam")
+        with mock.patch.dict(os.environ, {"STEAM_COMPAT_CLIENT_INSTALL_PATH": root}), \
+                mock.patch.dict(OPEN, {"PROTON_RUN": str(BIN / "droiddeck-proton-run"),
+                                    "store_launcher": lambda path: str(self.tmp / "launch.bat")}):
+            command = OPEN["command"](str(exe), [], "windows")[0]
+        located = RUN["locate"](str(exe), root)
+        self.assertEqual(command[1:5], ["--prefix", located.appid, "--compatdata", located.compatdata])
+        self.assertEqual(str(RUN["own_id"](str(exe))), str(RUN["locate"](str(exe), root).appid))
 
     def test_a_native_program_on_noexec_storage_runs_from_a_copy(self):
         program = self.write("storage/tool", elf(183))
@@ -185,7 +209,7 @@ class ImportTest(Temp):
 
         worker = threading.Thread(target=app)
         worker.start()
-        with mock.patch.dict(os.environ, {"BL_LAUNCH_DIR": str(launch)}), mock.patch.dict(OPEN, {"notify": lambda *a: None}):
+        with mock.patch.dict(os.environ, {"DD_LAUNCH_DIR": str(launch)}), mock.patch.dict(OPEN, {"notify": lambda *a: None}):
             self.assertEqual(OPEN["imported"]("appimage", "/root/Storage/Eden.AppImage", "0123456789abcdef", "Eden"), str(folder))
         worker.join()
         self.assertEqual(list(launch.iterdir()), [])
@@ -194,12 +218,12 @@ class ImportTest(Temp):
         launch = self.tmp / "launch"
         launch.mkdir()
         (launch / "desktop-import-0123456789abcdef.result").write_text("error Not enough space\n")
-        with mock.patch.dict(os.environ, {"BL_LAUNCH_DIR": str(launch)}), mock.patch.dict(OPEN, {"notify": lambda *a: None}):
+        with mock.patch.dict(os.environ, {"DD_LAUNCH_DIR": str(launch)}), mock.patch.dict(OPEN, {"notify": lambda *a: None}):
             with self.assertRaisesRegex(RuntimeError, "^Not enough space$"):
                 OPEN["imported"]("appimage", "/x.AppImage", "0123456789abcdef", "x")
 
     def test_outside_a_session_it_says_how_to_add_one(self):
-        with mock.patch.dict(os.environ, {"BL_LAUNCH_DIR": ""}):
+        with mock.patch.dict(os.environ, {"DD_LAUNCH_DIR": ""}):
             with self.assertRaisesRegex(RuntimeError, "Add an app"):
                 OPEN["imported"]("folder", "/x/start.sh", "0123456789abcdef", "x")
 
@@ -308,7 +332,7 @@ class GameFolderTest(Temp):
         worker = threading.Thread(target=app)
         worker.start()
         imports = {what: (str(self.tmp / "none"), made) for what, (_, made) in OPEN["IMPORTS"].items()}
-        with mock.patch.dict(os.environ, {"BL_LAUNCH_DIR": str(launch)}), \
+        with mock.patch.dict(os.environ, {"DD_LAUNCH_DIR": str(launch)}), \
                 mock.patch.dict(OPEN, {"CACHE": str(self.tmp / "cache"), "IMPORTS": imports, "notify": lambda *a: None}):
             self.assertEqual(OPEN["command"](str(script), ["-x"], "folder"), ([OPEN["SCRIPT_RUN"], str(copy), "-x"], str(script.parent)))
         worker.join()
@@ -324,7 +348,7 @@ class ExecTest(Temp):
         self.write("storage/Download/Game/helper.bin", elf(183), 0o755)
         self.write("storage/Download/Game/libhelper.so", elf(183))
         self.copied = []
-        env = {k: v for k, v in os.environ.items() if k not in ("BL_DESKTOP", "BL_BINFMT", "GAMESCOPE_WAYLAND_DISPLAY")}
+        env = {k: v for k, v in os.environ.items() if k not in ("DD_DESKTOP", "DD_BINFMT", "GAMESCOPE_WAYLAND_DISPLAY")}
         for patcher in (mock.patch.dict(OPEN, {"noexec": lambda path: True, "storage_root": lambda folder: str(self.storage),
                                                "copied_in": lambda path: self.copied.append(path) or "/opt/droiddeck-apps/game",
                                                "steam_title": lambda path: None, "notify": lambda *a: None,
@@ -353,7 +377,7 @@ class ExecTest(Temp):
 
     def test_an_x86_program_a_running_program_starts_runs_under_fex_where_it_lies(self):
         program = str(self.storage / "Download/Game/game.x86_64")
-        for env in ({}, {"BL_BINFMT": "1"}):
+        for env in ({}, {"DD_BINFMT": "1"}):
             with self.subTest(env=env):
                 self.assertEqual(self.open("--exec", program, "-x", env=env), [OPEN["FEX"], "run", "--mode", "auto", "--", program, "-x"])
         self.assertEqual(self.copied, [])
@@ -361,7 +385,7 @@ class ExecTest(Temp):
     def test_an_in_place_hand_off_keeps_the_callers_working_folder(self):
         program = str(self.storage / "Download/Game/game.x86_64")
         with mock.patch("os.chdir") as chdir:
-            self.open("--exec", program, env={"BL_BINFMT": "1"})
+            self.open("--exec", program, env={"DD_BINFMT": "1"})
             chdir.assert_not_called()
             self.open("--exec", str(self.storage / "Download/Game/helper.bin"))
             chdir.assert_called_once()
@@ -373,7 +397,7 @@ class ExecTest(Temp):
 
     def test_opening_an_x86_program_from_the_desktop_still_copies_its_folder_in(self):
         program = str(self.storage / "Download/Game/game.x86_64")
-        self.assertEqual(self.open(program, env={"BL_DESKTOP": "1"}), [OPEN["SCRIPT_RUN"], "/opt/droiddeck-apps/game"])
+        self.assertEqual(self.open(program, env={"DD_DESKTOP": "1"}), [OPEN["SCRIPT_RUN"], "/opt/droiddeck-apps/game"])
         self.assertEqual(self.copied, [program])
 
 
@@ -657,7 +681,7 @@ class ProtonRunTest(Temp):
             appid = OPEN["steam_title"](program)
             self.assertEqual(appid, "413150")
             self.assertEqual(OPEN["command"](program, [], "steam", appid=appid)[0], [OPEN["STEAM_LAUNCH"], "desktop", "413150"])
-            self.assertEqual(OPEN["placed"](["launch"], "steam", "run", {"BL_DESKTOP": "1"}), ["launch"])
+            self.assertEqual(OPEN["placed"](["launch"], "steam", "run", {"DD_DESKTOP": "1"}), ["launch"])
             self.assertIsNone(OPEN["steam_title"](str(self.write("Download/winemine.exe", b"MZ"))))
 
     def test_a_linux_steam_games_program_goes_to_steam_too(self):
@@ -685,6 +709,7 @@ class ProtonRunTest(Temp):
         self.assertEqual(entry, str(self.root / "compatibilitytools.d/droiddeck-proton-11-arm64/droiddeck-proton"))
         self.assertEqual(argv, [entry, "waitforexitandrun", str(program), "-fullscreen"])
         self.assertEqual(env["SteamAppId"], "413150")
+        self.assertEqual(env["DROIDDECK_DESKTOP_PROGRAM"], str(program))
         self.assertTrue((self.root / "steamapps/compatdata/413150").is_dir())
 
     def run_main(self, argv):
@@ -713,6 +738,7 @@ class ProtonRunTest(Temp):
         self.assertEqual((env["SteamAppId"], env["STEAM_COMPAT_DATA_PATH"]),
                          ("413150", str(self.root / "steamapps/compatdata/413150")))
         self.assertEqual(dirs, [str(program.parent)])
+        self.assertNotIn("DROIDDECK_DESKTOP_PROGRAM", env)
 
     def test_without_steam_a_game_steam_cannot_start_is_refused(self):
         self.write("Steam/appcache/appinfo.vdf", appinfo({413150: STARDEW}))
@@ -736,6 +762,20 @@ class ProtonRunTest(Temp):
         env = calls[0][2]
         self.assertEqual(env["STEAM_COMPAT_DATA_PATH"], str(signed))
         self.assertFalse((self.root / "steamapps/compatdata/2733369024").exists())
+
+    def test_a_launcher_run_keeps_the_resolved_compatdata_folder(self):
+        bat = self.write("Games/Epic/Game/.droiddeck-launch.bat", b"@echo off")
+        signed = self.root / "steamapps/compatdata/-1561598272"
+        signed.mkdir(parents=True)
+        other = self.tmp / "Library2/steamapps/compatdata/555"
+        other.mkdir(parents=True)
+        for compatdata, appid in ((signed, "2733369024"), (other, "555")):
+            with self.subTest(compatdata=str(compatdata)):
+                code, calls, dirs = self.run_main(["--prefix", appid, "--compatdata", str(compatdata), str(bat)])
+                self.assertIsNone(code)
+                self.assertEqual(calls[0][2]["STEAM_COMPAT_DATA_PATH"], str(compatdata))
+        code, calls, dirs = self.run_main(["--prefix", "555", str(bat)])
+        self.assertEqual(calls[0][2]["STEAM_COMPAT_DATA_PATH"], str(self.root / "steamapps/compatdata/555"))
 
     def test_prefix_folder_prefers_initialized_unsigned_over_empty_signed(self):
         signed = self.root / "steamapps/compatdata/-1561598272"

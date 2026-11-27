@@ -291,6 +291,58 @@ class GogMaintenanceTest {
         assertEquals("patch_(52404)+special.exe", GogContent.downloadFilename("https://example.invalid/patch_%2852404%29+special.exe?token=temporary"))
     }
 
+    private fun overlaySnapshot(base: JSONArray, dlc: JSONArray, owned: Set<String> = setOf("2")): GogInstallRecord {
+        val manifest = JSONObject().put("depots", JSONArray().put(JSONObject().put("productId", "1")
+            .put("languages", JSONArray().put("*")).put("files", base).put("items", base)).put(JSONObject().put("productId", "2")
+            .put("languages", JSONArray().put("*")).put("files", dlc).put("items", dlc)))
+        return GogContent.snapshot(GogInstallRecord("1", "depot"), GogBuild("build", "", 2, "", "https://example.invalid/manifest"),
+            "unused", ownership = { owned }, metadata = { _, _ -> manifest })
+    }
+
+    @Test fun generationTwoOwnedDepotOverlaysReplaceExactPathsBeforeValidation() {
+        val fixture = JSONObject(javaClass.classLoader!!.getResource("gog/gen2-overlay-excerpt.json")!!.readText())
+        val base = fixture.getJSONArray("base")
+        val dlc = fixture.getJSONArray("dlc")
+        base.put(JSONObject().put("path", "unique.bin").put("type", "DepotFile").put("chunks", JSONArray()))
+        val snapshot = overlaySnapshot(base, dlc)
+        assertEquals(3, snapshot.files.length())
+        assertEquals(listOf("gog.dat", "gog.idx", "unique.bin"), snapshot.files.objects().map { it.getString("path") })
+        for (i in 0..1) {
+            val file = snapshot.files.getJSONObject(i)
+            assertEquals("2", file.getString("product"))
+            assertEquals(dlc.getJSONObject(i).getJSONArray("chunks").toString(), file.getJSONArray("chunks").toString())
+            assertEquals(dlc.getJSONObject(i).getJSONArray("chunks").getJSONObject(0).getLong("size"), file.getLong("size"))
+        }
+        assertEquals("1", snapshot.files.getJSONObject(2).getString("product"))
+        GogFiles.validate(snapshot.files, temporary.newFolder())
+        val baseOnly = overlaySnapshot(base, dlc, emptySet())
+        assertEquals(base.getJSONObject(0).getJSONArray("chunks").toString(), baseOnly.files.getJSONObject(0).getJSONArray("chunks").toString())
+        assertTrue(baseOnly.files.objects().all { it.getString("product") == "1" })
+        GogFiles.validate(baseOnly.files, temporary.newFolder())
+    }
+
+    @Test fun overlaysDoNotHideCaseAliasesTraversalLinksOrPathTypeChanges() {
+        fun entry(path: String, type: String = "DepotFile") = JSONObject().put("path", path).put("type", type)
+        for (path in listOf("game.bin", "../Game.bin", "Data/../Game.bin", ".droiddeck-store.json")) {
+            val snapshot = overlaySnapshot(JSONArray().put(entry("Game.bin")), JSONArray().put(entry(path)))
+            assertThrows(IllegalArgumentException::class.java) { GogFiles.validate(snapshot.files, temporary.newFolder()) }
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            overlaySnapshot(JSONArray().put(entry("Game.bin")), JSONArray().put(entry("Game.bin", "DepotDirectory")))
+        }
+        assertThrows(IllegalStateException::class.java) {
+            overlaySnapshot(JSONArray().put(entry("Game.bin")), JSONArray().put(entry("Game.bin", "DepotLink")))
+        }
+        val identical = JSONArray().put(entry("Game.bin"))
+        assertEquals(1, overlaySnapshot(identical, identical).files.length())
+        val directories = JSONArray().put(entry("Data", "DepotDirectory"))
+        val merged = overlaySnapshot(directories, JSONArray().put(entry("Data", "DepotDirectory")).put(entry("Data/game.bin")))
+        assertEquals(2, merged.files.length())
+        GogFiles.validate(merged.files, temporary.newFolder())
+        val aliases = overlaySnapshot(JSONArray().put(entry("Data/a")), JSONArray().put(entry("data/b")))
+        assertThrows(IllegalArgumentException::class.java) { GogFiles.validate(aliases.files, temporary.newFolder()) }
+    }
+
     @Test fun pathsRejectTraversalSymlinksCaseCollisionsAndMetadataOverlap() {
         val folder = temporary.newFolder()
         for (path in listOf("../escape", "/absolute", "C:/file", "a/./file", "a//file")) {
@@ -302,10 +354,17 @@ class GogMaintenanceTest {
         File(folder, "Game.bin").writeText("original")
         assertThrows(IllegalArgumentException::class.java) { GogFiles.validate(JSONArray("""[{"path":"game.bin"}]"""), folder) }
         assertThrows(IllegalArgumentException::class.java) { GogFiles.validate(JSONArray("""[{"path":".droiddeck-store.json"}]"""), folder) }
+        val data = File(folder, "Data").apply { mkdirs() }
+        val installed = JSONArray()
+        for (i in 0 until 2000) { File(data, "Part$i.bin").writeText(""); installed.put(JSONObject().put("path", "Data/Part$i.bin")) }
+        GogFiles.validate(installed, folder)
+        assertThrows(IllegalArgumentException::class.java) { GogFiles.validate(JSONArray("""[{"path":"Data/Part0.bin"},{"path":"Data/part1.bin"}]"""), folder) }
         val outside = temporary.newFolder()
         try { Files.createSymbolicLink(File(folder, "link").toPath(), outside.toPath()) }
         catch (_: java.nio.file.FileSystemException) { return }
         assertThrows(IllegalArgumentException::class.java) { GogFiles.inside(folder, "link/game.exe") }
+        assertThrows(IllegalArgumentException::class.java) { GogFiles.validate(JSONArray("""[{"path":"Data/Part0.bin"},{"path":"link/game.exe"}]"""), folder) }
+        assertThrows(IllegalArgumentException::class.java) { GogFiles.validate(JSONArray("""[{"path":"a/./file"}]"""), folder) }
     }
 
     @Test fun resumedInstallSpaceCountsOnlyFilesStillMissing() {

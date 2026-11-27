@@ -12,7 +12,7 @@
 
 /* Some Unity games create and close an unused unnamed semaphore thousands of times a second, each
  * a wineserver round trip. A semaphore no request named between its create and its close stays
- * open and answers the next identical create. BL_SEMPOOL holds "<create_semaphore>,<close_handle>".
+ * open and answers the next identical create. DD_SEMPOOL holds "<create_semaphore>,<close_handle>".
  *
  * A pooled handle is open on the server but closed for the program, so a request naming one may be
  * a use after close: the handle then waits in sp_zombie until a thread whose request and reply fds
@@ -21,9 +21,9 @@
  * pipes or sockets. A thread's first request goes out before its fds are known, so a use after close
  * in it still reaches the server with the handle open. */
 
-int bl_from_ntdll(const void *caller) __attribute__((visibility("hidden")));
-int bl_nl_write(int fd, const void *buf, size_t count, ssize_t *rc) __attribute__((visibility("hidden")));
-int bl_nl_writev(int fd, const struct iovec *iov, int iovcnt, ssize_t *rc) __attribute__((visibility("hidden")));
+int dd_from_ntdll(const void *caller) __attribute__((visibility("hidden")));
+int dd_nl_write(int fd, const void *buf, size_t count, ssize_t *rc) __attribute__((visibility("hidden")));
+int dd_nl_writev(int fd, const struct iovec *iov, int iovcnt, ssize_t *rc) __attribute__((visibility("hidden")));
 
 #define SP_MSG 64
 #define SP_HDR 12
@@ -86,7 +86,7 @@ static void sp_watch_fork(void) {
 static int sp_on(void) {
   int s = __atomic_load_n(&sp_state, __ATOMIC_ACQUIRE);
   if (s >= 0) return s;
-  const char *e = getenv("BL_SEMPOOL");
+  const char *e = getenv("DD_SEMPOOL");
   char *end = NULL;
   long create = e ? strtol(e, &end, 10) : -1, close = -1;
   if (end == e) create = -1;
@@ -347,9 +347,9 @@ static void sp_resolve(void) {
 
 ssize_t write(int fd, const void *buf, size_t count) {
   ssize_t nl;
-  if (bl_nl_write(fd, buf, count, &nl)) return nl;
+  if (dd_nl_write(fd, buf, count, &nl)) return nl;
   if (__builtin_expect(!__atomic_load_n(&sp_real_write, __ATOMIC_ACQUIRE), 0)) sp_resolve();
-  if (count == SP_MSG && sp_on() && bl_from_ntdll(__builtin_return_address(0))) {
+  if (count == SP_MSG && sp_on() && dd_from_ntdll(__builtin_return_address(0))) {
     struct iovec one = { (void *)buf, count };
     ssize_t r = sp_send_masked(fd, &one, 1);
     if (r != -2) return r;
@@ -365,9 +365,9 @@ ssize_t write(int fd, const void *buf, size_t count) {
 
 ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
   ssize_t nl;
-  if (bl_nl_writev(fd, iov, iovcnt, &nl)) return nl;
+  if (dd_nl_writev(fd, iov, iovcnt, &nl)) return nl;
   if (__builtin_expect(!__atomic_load_n(&sp_real_writev, __ATOMIC_ACQUIRE), 0)) sp_resolve();
-  if (iovcnt > 0 && iov[0].iov_len == SP_MSG && sp_on() && bl_from_ntdll(__builtin_return_address(0))) {
+  if (iovcnt > 0 && iov[0].iov_len == SP_MSG && sp_on() && dd_from_ntdll(__builtin_return_address(0))) {
     ssize_t r = sp_send_masked(fd, iov, iovcnt);
     if (r != -2) return r;
     size_t total = 0;
@@ -384,7 +384,7 @@ ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
 
 ssize_t read(int fd, void *buf, size_t count) {
   if (__builtin_expect(!__atomic_load_n(&sp_real_read, __ATOMIC_ACQUIRE), 0)) sp_resolve();
-  if (__builtin_expect(sp_pending != SP_IDLE, 0) && count == SP_MSG && bl_from_ntdll(__builtin_return_address(0))) {
+  if (__builtin_expect(sp_pending != SP_IDLE, 0) && count == SP_MSG && dd_from_ntdll(__builtin_return_address(0))) {
     if (sp_pending == SP_FAKE) {
       if (fd != sp_rfd) return sp_real_read(fd, buf, count);
       sp_pending = SP_IDLE;
@@ -409,7 +409,7 @@ ssize_t read(int fd, void *buf, size_t count) {
     return r;
   }
   if (__builtin_expect(sp_learn_fd >= 0, 0) && sp_rfd < 0 && count == SP_MSG && fd != sp_learn_fd &&
-      bl_from_ntdll(__builtin_return_address(0))) {
+      dd_from_ntdll(__builtin_return_address(0))) {
     int wfd = sp_learn_fd;
     sp_learn_fd = -1;
     ssize_t r = sp_real_read(fd, buf, count);

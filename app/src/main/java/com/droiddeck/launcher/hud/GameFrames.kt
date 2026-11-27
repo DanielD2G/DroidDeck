@@ -1,6 +1,7 @@
 package com.droiddeck.launcher.hud
 
 import java.io.File
+import java.io.RandomAccessFile
 import kotlin.math.roundToInt
 
 internal class FrameStats {
@@ -159,7 +160,11 @@ internal class FrameStats {
     }
 }
 
-internal class GameFrameFeed(private val file: File, val stats: FrameStats = FrameStats()) {
+internal class GameFrameFeed(
+    private val file: File,
+    val stats: FrameStats = FrameStats(),
+    private val clockControl: File? = null,
+) {
     private var handle = 0L
     private var nextOpenNs = 0L
     private var lastRingFrameNs = 0L
@@ -171,10 +176,14 @@ internal class GameFrameFeed(private val file: File, val stats: FrameStats = Fra
     private var lastCompositorNs = 0L
     @Volatile private var compositorFrames = 0L
     private var seenCompositorFrames = 0L
+    private var clockShiftNs = 0L
+    private var clockShiftReadNs = Long.MIN_VALUE
 
     @Volatile var engine = ""
         private set
     @Volatile var steamFocused = false
+        private set
+    @Volatile var steamFocusKnown = false
         private set
     @Volatile var pid = 0
         private set
@@ -191,14 +200,23 @@ internal class GameFrameFeed(private val file: File, val stats: FrameStats = Fra
         val compositorAdded = compositorFrames != seenCompositorFrames
         seenCompositorFrames = compositorFrames
         if (handle == 0L) {
-            if (nowNs < nextOpenNs) return compositorAdded
+            if (nowNs < nextOpenNs) {
+
+                return compositorAdded
+            }
             nextOpenNs = nowNs + REOPEN_NS
             handle = runCatching { HudFrames.nativeOpen(file.path) }.getOrDefault(0L)
-            if (handle == 0L) return compositorAdded
+            if (handle == 0L) {
+
+                return compositorAdded
+            }
             HudFrames.nativePoll(handle, frametimes, times)
         }
         val n = HudFrames.nativePoll(handle, frametimes, times)
         if (n > 0) {
+            var shift = guestClockShift(nowNs, SHIFT_NS)
+            if (nowNs - (times[n - 1] + shift) > LIVE_NS) shift = guestClockShift(nowNs, SHIFT_RECHECK_NS)
+            for (i in 0 until n) times[i] += shift
             if (!fromGamescope) {
                 stats.reset()
                 fromGamescope = true
@@ -209,11 +227,22 @@ internal class GameFrameFeed(private val file: File, val stats: FrameStats = Fra
             fromGamescope = false
         }
         if (n <= 0 && nowNs - maxOf(lastRingFrameNs, nextOpenNs - REOPEN_NS) > STALE_NS) close()
+
         if (nowNs - lastInfoNs >= INFO_NS) {
             lastInfoNs = nowNs
             readInfo()
         }
         return n > 0 || compositorAdded
+    }
+
+    internal fun guestClockShift(nowNs: Long, maxAgeNs: Long): Long {
+        val control = clockControl ?: return 0L
+        if (clockShiftReadNs != Long.MIN_VALUE && nowNs - clockShiftReadNs < maxAgeNs) return clockShiftNs
+        clockShiftReadNs = nowNs
+        clockShiftNs = runCatching {
+            RandomAccessFile(control, "r").use { if (it.length() < Long.SIZE_BYTES) 0L else java.lang.Long.reverseBytes(it.readLong()) }
+        }.getOrDefault(0L).coerceAtLeast(0L)
+        return clockShiftNs
     }
 
     fun onCompositorFrame(nowNs: Long) {
@@ -230,6 +259,7 @@ internal class GameFrameFeed(private val file: File, val stats: FrameStats = Fra
     }
 
     fun close() {
+        fromGamescope = false
         if (handle != 0L) HudFrames.nativeClose(handle)
         handle = 0L
     }
@@ -245,6 +275,7 @@ internal class GameFrameFeed(private val file: File, val stats: FrameStats = Fra
         outputHeight = info[2]
         refreshMilliHz = info[3]
         steamFocused = info[4] != 0
+        steamFocusKnown = true
         engine = engineLabel(name)
     }
 
@@ -253,6 +284,11 @@ internal class GameFrameFeed(private val file: File, val stats: FrameStats = Fra
         private const val LIVE_NS = 2_000_000_000L
         private const val STALE_NS = 5_000_000_000L
         private const val INFO_NS = 500_000_000L
+        private const val SHIFT_NS = 1_000_000_000L
+        private const val SHIFT_RECHECK_NS = 100_000_000L
+        private const val CLOCK_CONTROL_PATH = "tmp/.dd-clock"
+
+        fun forRoot(root: File) = GameFrameFeed(File(root, HudFrames.PATH), clockControl = File(root, CLOCK_CONTROL_PATH))
 
         fun engineLabel(name: String): String = when (name) {
             "DXVK" -> "DXVK"

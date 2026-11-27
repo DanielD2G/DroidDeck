@@ -2,7 +2,12 @@ package com.droiddeck.launcher.ui
 
 import android.app.Activity
 import android.app.Application
+import android.content.BroadcastReceiver
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.Context
+import androidx.core.content.ContextCompat
+import com.droiddeck.launcher.session.BuildWatermarkSetting
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Typeface
@@ -14,11 +19,14 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
+import java.util.WeakHashMap
 import com.droiddeck.launcher.BuildConfig
 import com.droiddeck.launcher.QuestXrActivity
 
 object BuildWatermark {
     private const val TITLE_LIMIT = 80
+    private val activities = WeakHashMap<Activity, Unit>()
+    internal var lineProvider: () -> List<String>? = { lines() }
 
     fun lines(
         pr: Int = BuildConfig.PR_NUMBER,
@@ -38,31 +46,60 @@ object BuildWatermark {
         if (text.length <= TITLE_LIMIT) text else text.take(TITLE_LIMIT - 1).trimEnd() + "…"
 
     fun install(app: Application) {
-        val lines = lines() ?: return
+        ContextCompat.registerReceiver(
+            app,
+            object : BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) { refresh(context) }
+            },
+            IntentFilter(BuildWatermarkSetting.CHANGED),
+            "${app.packageName}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION",
+            null,
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
         app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
             override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {
                 if (activity is QuestXrActivity) return
-                val decor = activity.window.decorView as? ViewGroup ?: return
-                if (decor.findViewWithTag<View>(TAG) != null) return
-                val margin = (8 * activity.resources.displayMetrics.density).toInt()
-                decor.addView(
-                    MarkView(activity, lines).apply { tag = TAG },
-                    FrameLayout.LayoutParams(
-                        ViewGroup.LayoutParams.WRAP_CONTENT,
-                        ViewGroup.LayoutParams.WRAP_CONTENT,
-                        Gravity.BOTTOM or Gravity.END,
-                    ).apply { setMargins(margin, margin, margin, margin) },
-                )
+                synchronized(activities) { activities[activity] = Unit }
+                update(activity)
             }
 
             override fun onActivityStarted(activity: Activity) = Unit
-            override fun onActivityResumed(activity: Activity) = Unit
+            override fun onActivityResumed(activity: Activity) { update(activity) }
             override fun onActivityPaused(activity: Activity) = Unit
             override fun onActivityStopped(activity: Activity) = Unit
             override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
-            override fun onActivityDestroyed(activity: Activity) = Unit
+            override fun onActivityDestroyed(activity: Activity) { synchronized(activities) { activities.remove(activity) } }
         })
     }
+
+    fun refresh(context: Context) {
+        val current = synchronized(activities) { activities.keys.toList() }
+        current.forEach(::update)
+    }
+
+    private fun update(activity: Activity) {
+        if (activity is QuestXrActivity) return
+        val decor = activity.window.decorView as? ViewGroup ?: return
+        decor.findViewWithTag<View>(TAG)?.let(decor::removeView)
+        val prefs = com.droiddeck.launcher.session.SessionPrefs
+        val debugLogs = if (prefs.logsEnabled(activity) && prefs.gameDebugLogsEnabled(activity)) DEBUG_LOGS_LINE else null
+        val build = if (prefs.buildWatermarkEnabled(activity)) {
+            listOfNotNull(com.droiddeck.launcher.lab.LabOverlay.active?.let { "LAB | ${truncate(it.label)}" }) +
+                lineProvider().orEmpty()
+        } else emptyList()
+        val content = (build + listOfNotNull(debugLogs)).ifEmpty { return }
+        val margin = (8 * activity.resources.displayMetrics.density).toInt()
+        decor.addView(
+            MarkView(activity, content).apply { tag = TAG },
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM or Gravity.END,
+            ).apply { setMargins(margin, margin, margin, margin) },
+        )
+    }
+
+    internal const val DEBUG_LOGS_LINE = "GAME DEBUG LOGS ON | slows games"
 
     private const val TAG = "build-watermark"
 

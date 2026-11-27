@@ -67,8 +67,8 @@ object StoreAccounts {
     fun write(context: Context, store: Store, json: JSONObject) {
         unavailable.remove(store)
         val f = credentialsFile(context, store)
-        if (seal(f, json, retry = store == Store.XBOX) == null) {
-            check(store != Store.XBOX) { "Android Keystore is unavailable for Xbox credentials" }
+        if (seal(f, json, retry = store == Store.XBOX || store == Store.ROCKSTAR) == null) {
+            check(store != Store.XBOX && store != Store.ROCKSTAR) { "Android Keystore is unavailable for ${store.label} credentials" }
             put(f, json.toString())
         }
     }
@@ -90,7 +90,7 @@ object StoreAccounts {
     fun signedInAs(context: Context, store: Store): String? {
         val json = read(context, store) ?: return if (isUnavailable(store)) store.label else null
         if (store == Store.XBOX) return json.optString("username").takeIf { it.isNotBlank() }
-        if (store == Store.BATTLENET) return json.optString("display_name").takeIf { it.isNotBlank() }
+        if (store == Store.BATTLENET || store == Store.STEAM) return json.optString("display_name").takeIf { it.isNotBlank() }
         if (json.optString("access_token", "").isEmpty()) return null
         return json.optString("display_name", "").ifEmpty { json.optString("username", "") }.ifEmpty { store.label }
     }

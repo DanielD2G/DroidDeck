@@ -36,7 +36,43 @@ class GameEnvironmentStoreTest {
         context.getSharedPreferences("session", Context.MODE_PRIVATE).edit()
             .remove("logs")
             .remove("gameDebugLogsEnabled")
+            .remove("gameCpus")
             .commit()
+        listOf("game-environment.json.new", "game-cores.new").forEach { File(guest.parentFile, it).delete() }
+    }
+
+    @Test fun gameCoresChangedInSettingsReachTheGuestAtOnce() {
+        val live = File(LinuxRuntime.rootDir(context), "root/.config/droiddeck/game-cores")
+        val all = com.droiddeck.launcher.core.CpuCores.all
+
+        SessionPrefs.setGameCpus(context, all.last().toString())
+        assertEquals("${all.last()}\n", live.readText())
+
+        SessionPrefs.setGameCpus(context, com.droiddeck.launcher.core.CpuCores.format(all.toSet()))
+        assertEquals("\n", live.readText())
+    }
+
+    @Config(sdk = [34])
+    @Test fun gameCoresStillReachTheGuestWhenTheRestOfTheEnvironmentCannotBeWritten() {
+        val dir = File(LinuxRuntime.rootDir(context), "root/.config/droiddeck")
+        val last = com.droiddeck.launcher.core.CpuCores.all.last()
+        assertTrue(File(dir, "game-environment.json.new").mkdirs())
+
+        context.getSharedPreferences("session", Context.MODE_PRIVATE).edit().putString("gameCpus", last.toString()).commit()
+
+        assertTrue(runCatching { GameEnvironmentStore.publish(context) }.isFailure)
+        assertEquals("$last\n", File(dir, "game-cores").readText())
+    }
+
+    @Test fun gameCoresThatCannotBeWrittenLeaveNoOlderValueForTheGuest() {
+        val dir = File(LinuxRuntime.rootDir(context), "root/.config/droiddeck")
+        val all = com.droiddeck.launcher.core.CpuCores.all
+        SessionPrefs.setGameCpus(context, all.last().toString())
+        assertTrue(File(dir, "game-cores.new").mkdirs())
+
+        SessionPrefs.setGameCpus(context, all.first().toString())
+
+        assertFalse(File(dir, "game-cores").exists())
     }
 
     @Test fun gameDebugLogsAreOffByDefault() {
@@ -314,5 +350,28 @@ class GameEnvironmentStoreTest {
         val config = GameEnvironment.Config(shared = mapOf("DXVK_ASYNC" to "1"))
         GameEnvironmentStore.save(context, config)
         assertEquals(config, GameEnvironmentStore.read(context))
+    }
+
+    @Test fun savedSettingsFromBeforeTheRenameKeepTheirValues() {
+        val json = JSONObject("""{"version":1,"shared":{"BL_SYNC":"1","DXVK_HUD":"fps"},
+            "games":{"440":{"BL_FSYNC_FIRST":"1","BL_SYNC_FALLBACK":"0","DD_SYNC_FALLBACK":"1"}}}""")
+        val config = GameEnvironmentStore.decode(json)
+        assertEquals(mapOf("DD_SYNC" to "1", "DXVK_HUD" to "fps"), config.shared)
+        assertEquals(mapOf("DD_FSYNC_FIRST" to "1", "DD_SYNC_FALLBACK" to "1"), config.games["440"])
+    }
+
+    @Test fun unreadableSettingsAreSetAsideAndSessionsStillStart() {
+        val settings = File(context.filesDir, "game-environment.json")
+        val aside = File(context.filesDir, "game-environment.json.unreadable")
+        aside.delete()
+        for (broken in listOf("", """{"version":1,"shared":{"bad name":"1"}}""")) {
+            settings.writeText(broken)
+            assertEquals(GameEnvironment.Config(), GameEnvironmentStore.read(context))
+            assertFalse(settings.exists())
+            assertEquals(broken, aside.readText())
+        }
+        GameEnvironmentStore.publish(context)
+        assertEquals(1, JSONObject(guest.readText()).getInt("version"))
+        aside.delete()
     }
 }

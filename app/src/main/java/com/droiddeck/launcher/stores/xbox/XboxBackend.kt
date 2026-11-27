@@ -58,17 +58,30 @@ object XboxBackend : StoreBackend {
                 if (cached != null && !cached.needsRefresh(force)) { XboxGamertag.ensure(app); return@Thread }
                 val response = Xodus.run(app, listOf("library", "--json", "--market", market))
                 val licenses = XboxCatalog.access(response, account, market, report = { StoresState.logLine("Xbox: $it") })
-                val products = XboxCatalog.rawProducts(licenses.keys.toList(), market)
                 val cloud = runCatching { XboxCatalog.cloudCatalog(market) }
                     .onFailure { StoresState.logLine("Xbox: cloud lists unavailable (${it.javaClass.simpleName})") }.getOrNull()
-                val games = mergeEditions(products.mapNotNull { XboxCatalog.product(it, licenses, cloud) }).sortedBy { it.title.lowercase() }
-                StoresState.logLine("Xbox: library catalog requested=${licenses.size} returned=${products.size} supported=${games.size} " +
-                    "filtered=${products.size - games.size} backend-skipped=${response.optInt("skippedEntitlements")} " +
+                // The PC entitlement list leaves out console purchases and free games; the streaming service lists them.
+                val titles = runCatching { XboxCloudSession.titleList(XboxCloudSession.get(app, account), fresh = true) }
+                    .onFailure { StoresState.logLine("Xbox: cloud titles unavailable (${it.javaClass.simpleName})") }.getOrNull()
+                // Without the Game Pass lists an entitled title cannot be told apart from a purchase, so none are added.
+                val added = if (cloud == null) emptyMap<String, String>() else titles?.entitled.orEmpty().filter { it !in licenses }
+                    .associateWith { if (it in cloud.gamePass) "gamepass" else "owned" }
+                StoresState.logLine("Xbox: cloud titles=${titles?.ids?.size ?: -1} entitled=${titles?.entitled?.size ?: -1} " +
+                    "added=${added.size} (owned ${added.values.count { it == "owned" }}, gamepass ${added.values.count { it == "gamepass" }})")
+                val entitlements = licenses + added
+                val returned = java.util.concurrent.atomic.AtomicInteger()
+                val supported = XboxCatalog.productBatches(entitlements.keys.toList(), market) { batch ->
+                    returned.addAndGet(batch.size)
+                    batch.mapNotNull { XboxCatalog.product(it, entitlements, cloud) }
+                }
+                val games = mergeEditions(supported).sortedBy { it.title.lowercase() }
+                StoresState.logLine("Xbox: library catalog requested=${entitlements.size} returned=${returned.get()} supported=${supported.size} " +
+                    "shown=${games.size} backend-skipped=${response.optInt("skippedEntitlements")} " +
                     "pc=${games.count { it.xboxPc }} cloud=${games.count { it.xboxCloud }} cloud-only=${games.count { !it.xboxPc }} " +
                     "cloud-lists=${cloud?.gamePass?.size ?: -1}/${cloud?.all?.size ?: -1}")
                 synchronized(this) {
                     if (current != generation || StoreAccounts.signedInAs(app, store) != account) return@Thread
-                    access = licenses
+                    access = entitlements
                     runCatching { XboxLibraryCache.write(app, account, market, games) }
                         .onFailure { StoresState.logLine("Xbox: library cache could not be saved") }
                 }
@@ -112,9 +125,19 @@ object XboxBackend : StoreBackend {
     fun selectPackage(context: Context, choice: org.json.JSONObject) {
         val pending = packageChoice ?: return
         packageChoice = null
-        val item = pending.item.copy(extra = pending.item.extra + ("contentId" to choice.getString("contentId")))
+        val item = pending.item.chosen(choice)
         com.droiddeck.launcher.stores.download.SavedQueue.remember(context, item, pending.root)
         enqueue(context.applicationContext, item, pending.root)
+    }
+
+    /**
+     * The picker can offer a package in a different container format than the
+     * catalogue listed, and the installer dispatches on that format, so the
+     * choice decides it and the catalogue value only fills a missing one.
+     */
+    private fun CatalogItem.chosen(choice: org.json.JSONObject): CatalogItem {
+        val format = choice.optString("packageFormat").takeIf { it.isNotBlank() } ?: extra["format"].orEmpty()
+        return copy(extra = extra + mapOf("contentId" to choice.getString("contentId"), "format" to format))
     }
 
     override fun install(context: Context, item: CatalogItem, root: File) {
@@ -128,7 +151,7 @@ object XboxBackend : StoreBackend {
                 val choices = XboxCatalog.objects(plan.getJSONArray("choices")).filter { it.optBoolean("supported") && it.optString("kind") == "Game" }
                 check(choices.isNotEmpty()) { "This offer has no supported PC package." }
                 if (plan.getString("status") == "ready" && choices.size == 1) {
-                    val selected = item.copy(extra = item.extra + ("contentId" to choices.single().getString("contentId")))
+                    val selected = item.chosen(choices.single())
                     com.droiddeck.launcher.stores.download.SavedQueue.remember(app, selected, root)
                     enqueue(app, selected, root)
                 } else StoresState.post { packageChoice = PackageChoice(item, root, choices) }
