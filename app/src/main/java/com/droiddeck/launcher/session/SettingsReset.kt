@@ -12,21 +12,21 @@ object SettingsReset {
     private const val TAG = "SettingsReset"
 
     internal val SESSION_KEYS = setOf(
-        "orientation", "launcherFullscreen", "animations", "lowStorageWarning", "theme", "runSteamAtStartup", "startupSession", "addedGamesArt",
-        "dualScreenMode", "dualScreenSessionMode", "dualScreenLauncher", "dualScreenSessionControls", "androidTextFieldKeyboard",
-        "gameStoresEnabled", "gameStoresSpeedTier", "gameStoresParallel", "storesOpenTab", "storesShowMature",
+        "orientation", "launcherFullscreen", "controllerHaptics", "animations", "lowStorageWarning", "theme", "runSteamAtStartup", "startupSession", "addedGamesArt",
+        "drawerWidthDp", "dualScreenMode", "dualScreenSessionMode", "dualScreenLauncher", "dualScreenSessionControls", "androidTextFieldKeyboard",
+        "soundtracksIngame", "gameStoresSpeedTier", "gameStoresParallel", "storesOpenTab", "storesShowMature",
         "storesInstallLanguage",
-        "hud", "hudDeck", "hudFps", "hudBattery", "hudGraph", "hudColor", "hudOpacity", "__KEEP_droidDeckHud__", "__KEEP_droidDeckHudPos__", "backHold", "backActionsInverted", "backDoubleTapMs", "touch", "osc", "shape", "steamController",
+        "hud", "hudDeck", "hudFps", "hudBattery", "hudGraph", "hudColor", "hudOpacity", "__KEEP_droidDeckHud__", "__KEEP_droidDeckHudPos__", "backHold", "dockedMenuController", "backActionsInverted", "backDoubleTapMs", "touch", "pen", "penButton", "osc", "shape", "steamController",
         "gamepadLeft", "gamepadRight", "pipAutoEnter", "unfoldedControls", "unfoldedControlsWithController",
-        "stretch16x9", "picturePosition", "railLabels", "pcKeyboardSize", "pcKeyboardOpacity", "pcKeyboardHiddenKeys",
+        "stretch16x9", "avoidNotch", "picturePosition", "integerScaling", "railLabels", "developerTools", "navTabOrder", "navTabShelved", "navTabHidden", "drawerPageOrder", "drawerPageHidden", "pcKeyboardSize", "pcKeyboardOpacity", "pcKeyboardHiddenKeys",
         "gpuDriverMode", "androidDriver", "linuxDriver", "linuxDriver.steam", "linuxDriver.desktop",
-        "tuSysmem", "glThread", "noGlError", "zinkLazy", "mangoapp", "gpuClockPin", "gamescopeRealtime", "ramCapMb", "vramCapMb", "zramClient",
+        "tuSysmem", "glThread", "noGlError", "zinkLazy", "mangoapp", "gpuClockPin", "gamescopeRealtime", "paceCores",
         "directAudio", "mic", "wifiDiscovery", "clientCpusOverride", "clientCpus", "gameCpus",
-        "noXalia", "fastSync", "fsyncFirst", "syncFallback", "prootNoSeccomp", "prootFastPath", "cursorComposite",
-        "guestHostname", "fexPreset", "forceSsbs", "logs", "gameDebugLogsEnabled", "enhancedDiagnosticsNext", "storageDiagnostics",
-        "upscaler", "upscaleSharpness", "screenEffects", "textureAnisotropy", "textureLodBias",
-        "steamDownloadsInBackground", "steam_offline", "bootMovie", "bootMovieSound", "bootMovieVolume", "bootMovieSeconds",
-        "bootMovieApplyNext", "bootMovieSteamSeen",
+        "noXalia", "fastSync", "fsyncFirst", "syncFallback", "prootNoSeccomp", "prootFastPath", "nativeUserland", "cursorComposite",
+        "guestHostname", "fexPreset", "forceSsbs", "logs", "gameDebugLogsEnabled", "enhancedDiagnosticsNext", "storageDiagnostics", "buildWatermark",
+        "upscaler", "upscaleSharpness", "screenEffects", "blackFrameInsertion", "textureAnisotropy", "textureLodBias",
+        "steamDownloadsInBackground", "steam_offline", "steam_offline_auto", "steam_offline_by_network", "bootMovie", "bootMovieSound", "bootMovieVolume", "bootMovieSeconds", "skipBootMovie",
+        "bootMovieApplyNext", "bootMovieSteamSeen", "bootMovieShuffle",
         "questDefaultsV1", "telemetryAuto", "telemetryOff", "statsStrip", "statsHud", "bottomHud", "bottomStripMetrics", "bottomStripTabs", "statsDash", "statsSpeedUnit",
     )
 
@@ -43,6 +43,7 @@ object SettingsReset {
         var ok = true
         val session = context.getSharedPreferences("session", Context.MODE_PRIVATE)
         session.edit().apply { session.all.keys.filter { isSessionSetting(it) }.forEach { remove(it) } }.commit()
+        BuildWatermarkSetting.setEnabled(context, true)
         ControllerPrefs.resetAll(context)
         InputProfiles.resetAll(context)
         context.getSharedPreferences("app-ui", Context.MODE_PRIVATE).edit().clear().commit()
@@ -66,7 +67,7 @@ object SettingsReset {
         }
 
         QuestExperimental.initialize(context)
-        runCatching { OfflineMode.apply(context, LinuxRuntime.rootDir(context)) }
+        runCatching { OfflineMode.setEnabled(context, false) }
             .onFailure { ok = false; Log.w(TAG, "Could not turn offline mode off", it) }
         runCatching { GameEnvironmentStore.publish(context) }
             .onFailure { ok = false; Log.w(TAG, "Could not update game environment", it) }

@@ -85,6 +85,7 @@ object StoresState {
             do {
                 seen = refreshRequests.get()
                 runCatching { com.droiddeck.launcher.stores.battlenet.BattleNetClient.syncAccount(app) }
+                runCatching { com.droiddeck.launcher.stores.steam.SteamStore.syncAccount(app) }
                 val found = Store.entries.mapNotNull { store -> StoreAccounts.displayName(app, store)?.let { store to it } }
                 val onDisk = StoreInstallRoot.gameFolders(app).mapNotNull { folder ->
                     StoreGameSidecar.read(folder)?.takeIf { it.isInstalled || it.state == StoreGameSidecar.STATE_UPDATING }?.let { InstalledStoreGame(it, folder) }
@@ -202,6 +203,7 @@ object StoresState {
             backend?.signOut(app)
             if (store == Store.GOG) com.droiddeck.launcher.stores.gog.GogComet.replaceAccount { StoreAccounts.clear(app, store) }
             else if (store != Store.XBOX || backend == null) StoreAccounts.clear(app, store)
+            StoreLibraryCache.clear(app, store)
             if (store == Store.GAMEJOLT) {
                 com.droiddeck.launcher.stores.gamejolt.GameJoltCollections.clear()
                 com.droiddeck.launcher.stores.gamejolt.GameJoltUpdates.clear(app)
@@ -236,8 +238,30 @@ object StoresState {
     var itchPicking by mutableStateOf<CatalogItem?>(null)
     var gameJoltPicking by mutableStateOf<CatalogItem?>(null)
 
+    /** Store cards whose free game is being added to the account. */
+    val claiming = mutableStateMapOf<String, Boolean>()
+
+    fun canClaim(item: CatalogItem): Boolean = !item.accessible && isSignedIn(item.store) && backends[item.store]?.canClaim(item) == true
+
+    /** Adds a free game to the account, then refreshes the library so it can be installed; [failed] runs when the store refused. */
+    fun claim(context: Context, item: CatalogItem, failed: () -> Unit) {
+        val backend = backends[item.store] ?: return failed()
+        if (claiming.put(item.key, true) == true) return
+        val app = context.applicationContext
+        background("stores-claim", onFailure = { main.post { claiming.remove(item.key); failed() } }) {
+            val ok = backend.claim(app, item)
+            logLine("${item.store.label}: ${item.title} ${if (ok) "added to the library" else "could not be added; opening the store page"}")
+            if (ok) backend.syncLibrary(app, true)
+            main.post {
+                claiming.remove(item.key)
+                if (!ok) failed()
+            }
+        }
+    }
+
     fun requestInstall(context: Context, item: CatalogItem) {
         askForNotifications(context)
+        if (item.store == Store.STEAM) { com.droiddeck.launcher.stores.steam.SteamStore.requestInstall(context, item); return }
         if (item.store == Store.ITCH && item.extra["uploadId"].isNullOrEmpty()) { itchPicking = item; return }
         if (item.store == Store.GAMEJOLT && item.extra["buildId"].isNullOrEmpty()) { gameJoltPicking = item; return }
         if (isUnfinished(item)) { install(context, item); return }
@@ -256,6 +280,7 @@ object StoresState {
 
     fun install(context: Context, item: CatalogItem, root: java.io.File? = null, language: String? = null) {
         val app = context.applicationContext
+        if (item.store == Store.STEAM) { com.droiddeck.launcher.stores.steam.SteamStore.restore(app, item); return }
         val targetRoot = root ?: StoreInstallRoot.defaultTarget(app)?.root ?: StoreInstallRoot.installRoot(app)
         if (item.store == Store.BATTLENET && !com.droiddeck.launcher.stores.battlenet.BattleNetInstall.headless(item)) {
             backends[item.store]?.install(app, item, targetRoot)
@@ -293,21 +318,35 @@ object StoresState {
         val key = "${game.sidecar.store.id}:${game.sidecar.id}"
         uninstalling[key] = 0f
         background("stores-uninstall", onFailure = { main.post { uninstalling.remove(key); onDone() } }) {
-            runCatching { backends[game.sidecar.store]?.uninstall(app, game) }
-            if (game.sidecar.store == Store.BATTLENET && com.droiddeck.launcher.runtime.BattleNet.games(app).any { it.folder.absolutePath == game.folder.absolutePath }) {
+            if (!com.droiddeck.launcher.stores.download.DownloadQueue.stopForRemoval(app, key)) {
+                logLine("kept \"${game.sidecar.title}\": its download or update is still running")
                 main.post { uninstalling.remove(key); onDone() }
                 return@background
             }
-            StoreInstalls.uninstall(app, game, progress = { f -> main.post { if (key in uninstalling) uninstalling[key] = f } }, removed = {
-                main.post {
-                    installed = installed.filterNot { it.folder.absolutePath == game.folder.absolutePath }
-                    uninstalling.remove(key)
-                    if (game.sidecar.store == Store.ITCH) com.droiddeck.launcher.stores.itch.ItchUpdates.applied(app, key)
-                    if (game.sidecar.store == Store.GAMEJOLT) com.droiddeck.launcher.stores.gamejolt.GameJoltUpdates.applied(app, key)
-                }
-            })
-            main.post(onDone)
+            try {
+                StoreInstalls.awaitDiscard(game.folder)
+                uninstallHeld(app, game, key, onDone)
+            } finally {
+                com.droiddeck.launcher.stores.download.DownloadQueue.releaseRemoval(key)
+            }
         }
+    }
+
+    private fun uninstallHeld(app: Context, game: InstalledStoreGame, key: String, onDone: () -> Unit) {
+        runCatching { backends[game.sidecar.store]?.uninstall(app, game) }
+        if (game.sidecar.store == Store.BATTLENET && com.droiddeck.launcher.runtime.BattleNet.games(app).any { it.folder.absolutePath == game.folder.absolutePath }) {
+            main.post { uninstalling.remove(key); onDone() }
+            return
+        }
+        StoreInstalls.uninstall(app, game, progress = { f -> main.post { if (key in uninstalling) uninstalling[key] = f } }, removed = {
+            main.post {
+                installed = installed.filterNot { it.folder.absolutePath == game.folder.absolutePath }
+                uninstalling.remove(key)
+                if (game.sidecar.store == Store.ITCH) com.droiddeck.launcher.stores.itch.ItchUpdates.applied(app, key)
+                if (game.sidecar.store == Store.GAMEJOLT) com.droiddeck.launcher.stores.gamejolt.GameJoltUpdates.applied(app, key)
+            }
+        })
+        main.post(onDone)
     }
 
     @Volatile var libraryListener: (() -> Unit)? = null
@@ -359,6 +398,12 @@ interface StoreBackend {
     fun syncLibrary(context: Context, force: Boolean)
     fun loadShelves(context: Context, force: Boolean)
     fun search(context: Context, query: String): List<CatalogItem> = emptyList()
+
+    /** Whether this store can add a free game to the account itself, rather than through its website. */
+    fun canClaim(item: CatalogItem): Boolean = false
+
+    /** Adds a free game to the account; true once the store has it in the account's library. */
+    fun claim(context: Context, item: CatalogItem): Boolean = false
     fun install(context: Context, item: CatalogItem, root: java.io.File)
     fun uninstall(context: Context, game: InstalledStoreGame)
 }

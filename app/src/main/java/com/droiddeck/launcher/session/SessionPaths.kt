@@ -23,6 +23,12 @@ object SessionPaths {
     @Volatile
     private var ended: File? = null
 
+    @Volatile
+    private var startedAt = 0L
+
+    @Volatile
+    private var debugLogsContext: Context? = null
+
     @Synchronized
     fun beginOrCurrent(context: Context, label: String? = null): File {
         dir?.let { if (it.isDirectory) return it }
@@ -38,8 +44,10 @@ object SessionPaths {
         var made = File(parent, "$day-${"%02d".format(Locale.US, number)}-$what")
         while (made.exists()) made = File(parent, "$day-${"%02d".format(Locale.US, ++number)}-$what")
         EnhancedDiagnostics.clearRecordFor(context, made)
+        startedAt = System.currentTimeMillis()
         if (!made.isDirectory && !made.mkdirs()) Log.e(TAG, "could not create $made")
         dir = made
+        debugLogsContext = if (SessionPrefs.gameDebugLogsEnabled(context)) context.applicationContext else null
         if (enhanced && !EnhancedDiagnostics.consumeInto(context, made)) {
             Log.e(TAG, "could not activate enhanced diagnostics for $made")
         }
@@ -48,6 +56,8 @@ object SessionPaths {
     }
 
     fun current(): File? = dir
+
+    fun startedAt(folder: File): Long = if (dir == folder) startedAt else 0L
 
     fun currentSessionLogsRetained(context: Context): Boolean =
         dir?.let { it.parentFile == SessionFiles.logDirectory(context) } ?: true
@@ -59,6 +69,9 @@ object SessionPaths {
         val taken = dir
         dir = null
         if (taken != null) ended = taken
+        val expiring = debugLogsContext
+        debugLogsContext = null
+        if (taken != null && expiring != null) SessionPrefs.expireGameDebugLogs(expiring)
         return taken
     }
 

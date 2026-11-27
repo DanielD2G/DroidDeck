@@ -25,11 +25,16 @@ struct dmabuf_buffer {
     struct vkp_image *img;
     void *ahb_state;
 };
+enum surface_role { ROLE_NONE, ROLE_TOPLEVEL, ROLE_SUBSURFACE };
 struct surface {
+    enum surface_role role;
+    struct surface *parent;
+    int sub_desync;
     struct wl_resource *dmabuf;
     struct dmabuf_buffer *dmabuf_buf;
     struct wl_listener dmabuf_destroy;
     int releases_pending;
+    int release_pace_open;
     int64_t next_release_ns;
 };
 /* PRODUCTION_STRUCTS */
@@ -113,7 +118,7 @@ static void test_queue(int mixed, int client_gone) {
     g_release_timer_fd = 123; g_refresh_ns = 100000;
     drop_dmabuf(&s, 1); assert(s.releases_pending == 1 && !r.releases);
     assert(last_timer.it_value.tv_sec || last_timer.it_value.tv_nsec);
-    if (mixed) { init_resource(&shm, NULL); release_buffer(&s, &shm, now_ns()); }
+    if (mixed) { init_resource(&shm, NULL); droiddeck_release_buffer(&s, &shm, 1, now_ns()); }
     pending_releases_forget_surface(&s);
     g_dev_state = -3;
     fire_timer();

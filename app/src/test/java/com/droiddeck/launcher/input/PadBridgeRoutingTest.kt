@@ -71,7 +71,7 @@ class PadBridgeRoutingTest {
             InputDevice.KEYBOARD_TYPE_NONE, id = -1)
         assertTrue(virtual.isVirtual)
         assertFalse(PadBridge.isFromController(virtual))
-        for (uinputName in listOf("uinput-xiaomi", "uinput-fpc", "uinput_nav")) {
+        for (uinputName in listOf("uinput-xiaomi", "uinput-fpc", "uinput_nav", "ui-input-xiaomi")) {
             val phantom = device(
                 InputDevice.SOURCE_GAMEPAD or InputDevice.SOURCE_JOYSTICK,
                 InputDevice.KEYBOARD_TYPE_NONE,
@@ -191,12 +191,24 @@ class PadBridgeRoutingTest {
     @Implements(KeyEvent::class)
     class RegisteredKeyEvent : ShadowKeyEvent() {
         @RealObject private lateinit var event: KeyEvent
-        @Implementation override fun getDevice(): InputDevice? = Shadow.directlyOn(event as InputEvent, InputEvent::class.java, "getDevice")
+        @Implementation override fun getDevice(): InputDevice? {
+            if (lookupsLeft == 0) return null
+            if (lookupsLeft > 0) lookupsLeft--
+            return Shadow.directlyOn(event as InputEvent, InputEvent::class.java, "getDevice")
+        }
+
+        companion object { @JvmField var lookupsLeft = -1 }
     }
 
     @Implements(MotionEvent::class)
     class RegisteredMotionEvent : ShadowMotionEvent() {
         @RealObject private lateinit var event: MotionEvent
-        @Implementation override fun getDevice(): InputDevice? = Shadow.directlyOn(event as InputEvent, InputEvent::class.java, "getDevice")
+        @Implementation override fun getDevice(): InputDevice? {
+            if (lookupsLeft == 0) return null
+            if (lookupsLeft > 0) lookupsLeft--
+            return Shadow.directlyOn(event as InputEvent, InputEvent::class.java, "getDevice")
+        }
+
+        companion object { @JvmField var lookupsLeft = -1 }
     }
 }

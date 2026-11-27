@@ -31,6 +31,7 @@ object AddedGames {
         val exeUncertain: Boolean = false,
         val launchOptions: String = "",
         val single: Boolean = false,
+        val steamProgram: Boolean = true,
     ) {
         fun folderName(): String = folder.name
     }
@@ -97,15 +98,16 @@ object AddedGames {
         return File(LinuxRuntime.rootDir(context), guest.removePrefix("/"))
     }
 
-    fun candidates(folder: File): List<File> = rank(folder).exes
+    fun candidates(folder: File, reuse: Boolean = false): List<File> = rank(folder, reuse).exes
 
     fun rank(folder: File, reuse: Boolean = false): GameExePicker.Ranking {
-        val key = "${folder.path}|${folder.lastModified()}"
+        val declared = declaredExes(folder)
+        val stamp = declared.fold(0L) { hash, exe -> hash * 31 + exe.path.hashCode() }
+        val key = "${folder.path}|${folder.lastModified()}|$stamp"
         val now = System.currentTimeMillis()
         ranked[key]?.takeIf { now - it.first < RANK_FRESH_MS }?.let { return it.second }
-        if (reuse) kept?.rank(folder)?.let { return it }
+        if (reuse) kept?.rank(folder, stamp)?.let { return it }
         val guessed = GameExePicker.rank(folder) { !skipExe(it.name) }
-        val declared = declaredExes(folder)
         val preferred = declared.map { it.path }.toSet()
         val result = if (declared.isEmpty()) guessed else GameExePicker.Ranking(
             declared + guessed.exes.filter { it.path !in preferred },
@@ -115,7 +117,7 @@ object AddedGames {
         )
         if (ranked.size > 256) ranked.clear()
         ranked[key] = now to result
-        kept?.keepRank(folder, result)
+        kept?.keepRank(folder, result, stamp)
         return result
     }
 
@@ -200,13 +202,19 @@ object AddedGames {
     private val scanning = Any()
 
     fun scan(context: Context): List<Game> = synchronized(scanning) {
-        val file = File(context.filesDir, AddedGamesCache.FILE)
-        val cache = kept?.takeIf { it.file == file } ?: AddedGamesCache(file).also { kept = it }
+        val cache = cache(context)
         try {
             scanAll(context)
         } finally {
             cache.save()
         }
+    }
+
+    private val keeping = Any()
+
+    private fun cache(context: Context): AddedGamesCache = synchronized(keeping) {
+        val file = File(context.filesDir, AddedGamesCache.FILE)
+        kept?.takeIf { it.file == file } ?: AddedGamesCache(file).also { kept = it }
     }
 
     private fun scanAll(context: Context): List<Game> {
@@ -225,13 +233,14 @@ object AddedGames {
                 if (folder.name.lowercase() in steamInstalls || isSteamLibraryFolder(folder.name)) continue
                 if (folder.path in removed) continue
                 if (folder.name == "Games" && StoreInstallRoot.roots(context).any { it.absolutePath == folder.absolutePath }) continue
-                for (game in expand(folder, entries, reuse = true)) if (game.path !in removed) scanGame(context, game, out, reuse = true)
+                timed(folder) { for (game in expand(folder, entries, reuse = true)) if (game.path !in removed) scanGame(context, game, out, reuse = true) }
             }
         }
         for (entry in AddedExes.list(context)) {
             val folder = File(entry.folder)
             if (folder.path in removed || !folder.isDirectory) continue
-            scanGame(context, folder, out, single = entry, reuse = true)
+            if (StoreGameSidecar.read(folder)?.isInstalled == false) continue
+            timed(folder) { scanGame(context, folder, out, single = entry, reuse = true) }
         }
         for (folder in libraryDepotInstalls(context)) if (folder.path !in removed) scanGame(context, folder, out, reuse = true)
         for (folder in StoreInstallRoot.gameFolders(context)) if (StoreInstallRoot.isFinished(folder)) scanGame(context, folder, out, reuse = true)
@@ -241,11 +250,26 @@ object AddedGames {
         return out.distinctBy { it.folder.canonicalPath }
     }
 
-    fun single(context: Context, folderPath: String): Game? {
+    private const val SLOW_FOLDER_MS = 1_000L
+
+    private inline fun timed(folder: File, block: () -> Unit) {
+        val began = android.os.SystemClock.elapsedRealtime()
+        block()
+        val took = android.os.SystemClock.elapsedRealtime() - began
+        if (took >= SLOW_FOLDER_MS) Log.i(TAG, "games: scanning ${folder.path} took ${took}ms")
+    }
+
+    fun single(context: Context, folderPath: String, reuse: Boolean = false): Game? {
         val folder = File(folderPath)
         if (!folder.isDirectory || folderPath in SessionPrefs.removedAddedGames(context)) return null
         val out = ArrayList<Game>(1)
-        scanGame(context, folder, out, single = AddedExes.list(context).firstOrNull { it.folder == folderPath })
+        val entry = AddedExes.list(context).firstOrNull { it.folder == folderPath }
+        val cache = if (reuse) cache(context) else null
+        try {
+            scanGame(context, folder, out, single = entry, reuse = reuse)
+        } finally {
+            cache?.save()
+        }
         return out.firstOrNull()
     }
 
@@ -322,7 +346,14 @@ object AddedGames {
         val path = canonical(exe)
         val owner = ownerFolder(app, exe)
         if (owner != null && owner.path !in SessionPrefs.removedAddedGames(app)) {
-            single(app, owner.path)?.takeIf { canonical(it.exe) == path }?.let { return AddResult.Existing(it) }
+            single(app, owner.path)?.takeIf { canonical(it.exe) == path }?.let {
+                val keep = listOf(it.exe, exe).firstOrNull { f -> guestPath(app, f) != null }
+                if (keep != null) {
+                    SessionPrefs.setAddedGameExe(app, owner.path, keep.path)
+                    AddedExes.put(app, AddedExes.Entry(owner.path, keep.path))
+                }
+                return AddResult.Existing(it)
+            }
         }
         if (guestPath(app, exe) == null) {
             (owner ?: exe.parentFile)?.takeIf { guestPath(app, it) == null }?.let { bindFolder(app, it) }
@@ -331,7 +362,7 @@ object AddedGames {
         val folder = owner ?: exe.parentFile ?: return AddResult.NotFound
         SessionPrefs.setAddedGameRemoved(app, folder.path, false)
         SessionPrefs.setAddedGameExe(app, folder.path, exe.path)
-        if (owner == null) AddedExes.put(app, AddedExes.Entry(folder.path, exe.path))
+        AddedExes.put(app, AddedExes.Entry(folder.path, exe.path))
         val game = single(app, folder.path) ?: return AddResult.NotFound
         AddedGamesPublisher.later(app) { com.droiddeck.launcher.stores.SteamLiveShortcuts.sync(app, listOf(game)) { true } }
         Log.i(TAG, "added ${game.name} from its exe")
@@ -417,7 +448,8 @@ object AddedGames {
 
     private fun scanGame(context: Context, folder: File, out: MutableList<Game>, single: AddedExes.Entry? = null, reuse: Boolean = false) {
         run {
-            val sidecar = StoreGameSidecar.read(folder)
+            val sidecar = StoreGameSidecar.read(folder)?.let { com.droiddeck.launcher.stores.StoreLaunch.adopt(folder, it) }
+            if (sidecar?.store == Store.ROCKSTAR && sidecar.launcher != com.droiddeck.launcher.stores.StoreLaunch.LAUNCHER) return
             sidecar?.takeIf { it.id.isNotEmpty() }?.let { SessionPrefs.followStoreGame(context, "${it.store.id}:${it.id}", folder.path) { old -> !File(old).exists() } }
             val ranking = rank(folder, reuse)
             val candidates = ranking.exes
@@ -425,14 +457,15 @@ object AddedGames {
             val chosen = picked.takeIf { it.isNotEmpty() }?.let { File(it) }?.takeIf { it.isFile }
                 ?: single?.takeIf { it.picked }?.let { File(it.exe) }?.takeIf { it.isFile }
             val found = chosen ?: sidecar?.exeFile(folder)?.takeIf { it.isFile } ?: candidates.firstOrNull() ?: return
-            val epicLauncher = sidecar?.takeIf { it.store == Store.EPIC && (chosen == null || canonical(chosen) == canonical(it.exeFile(folder))) }
+            val storeLauncher = sidecar?.takeIf { chosen == null || canonical(chosen) == canonical(it.exeFile(folder)) }
                 ?.launcherFile(folder)?.takeIf { it.isFile }
-            val launch = epicLauncher ?: if (chosen == null) sidecar?.launcherFile(folder)?.takeIf { it.isFile } ?: found else found
+            val launch = storeLauncher ?: found
             val foundGuest = guestPath(context, launch)
             if (foundGuest == null) { Log.w(TAG, "${folder.name}: the session cannot see ${launch.path}"); return }
             val autoName = sidecar?.title ?: identifiedName(folder, found) ?: folder.name
             val crc = CRC32().apply { update(("\"${foundGuest.replaceFirst(Regex("^$LIBRARY/"), "$LEGACY_LIBRARY/")}\"" + autoName).toByteArray()) }.value
             val appId = SessionPrefs.addedGameAppId(context, folder.path, crc or 0x80000000L)
+            if (sidecar?.store == Store.ROCKSTAR) com.droiddeck.launcher.stores.rockstar.RockstarLaunch.applyDefaults(context, sidecar.id, appId)
             val config = accountConfig(SessionPrefs.activeSteamRoot(context))
             val record = config?.let { shortcutRecord(it, appId) }
             val rev = record?.optInt("rev", 0) ?: 0
@@ -452,13 +485,23 @@ object AddedGames {
             val guestDir = SessionPrefs.addedGameStartIn(context, folder.path).takeIf { sidecar == null && it.isNotEmpty() }
                 ?: sidecarDir
                 ?: guestPath(context, (if (adopted != null) adopted else launch).parentFile ?: folder) ?: return
-            val steamId = config?.let { steamRoute(it, appId) }
+            if (adopted == null && SessionPrefs.addedGameAdopted(context, folder.path, "Exe") == null &&
+                guestPath(context, folder)?.let { steamEditedTo(it, record, guestExe) } == true) {
+                SessionPrefs.setAddedGameAdopted(context, folder.path, "Exe", exe.path)
+            }
+            val steamProgram = candidates.firstOrNull()?.let { canonical(it) == canonical(exe) } ?: true ||
+                SessionPrefs.addedGameAdopted(context, folder.path, "Exe")?.let { canonical(File(it)) == canonical(exe) } == true
+            val steamId = config?.takeIf { steamProgram }?.let { steamRoute(it, appId) }
             out.add(Game(folder, name, exe, guestExe, guestDir, appId,
                 steamId?.toLong() ?: ((appId shl 32) or 0x02000000L), candidates, steamId,
                 source = sidecar?.store?.id ?: Library.ADDED, storeId = sidecar?.id,
                 exeUncertain = sidecar == null && chosen == null && adopted == null && ranking.uncertain,
-                launchOptions = if (sidecar == null) SessionPrefs.addedGameLaunch(context, folder.path) else "",
-                single = single != null))
+                launchOptions = when {
+                    sidecar == null -> SessionPrefs.addedGameLaunch(context, folder.path)
+                    sidecar.store == Store.UBISOFT -> com.droiddeck.launcher.stores.ubisoft.UbisoftConnect.launchOptions(context)
+                    else -> ""
+                },
+                single = single != null, steamProgram = steamProgram))
         }
     }
 
@@ -498,6 +541,11 @@ object AddedGames {
         return file.takeIf { inside && it.isFile }
     }
 
+    internal fun steamEditedTo(folderGuest: String, record: JSONObject?, guestExe: String): Boolean {
+        val steam = unquote(record?.optJSONObject("steam")?.optString("Exe"))
+        return steam == guestExe && steam != unquote(record?.optJSONObject("app")?.optString("Exe")) && steam.startsWith("$folderGuest/")
+    }
+
     private fun unquote(value: String?): String = value.orEmpty().trim().trim('"')
 
     internal fun adoptSteamEdits(context: Context, folder: File, record: JSONObject) {
@@ -523,9 +571,22 @@ object AddedGames {
         }
     }
 
+    class Listed(val appId: Long, val name: String, val launchOptions: String)
+
+    fun listingFile(context: Context): File = File(context.filesDir, "session/added-games.json")
+
+    fun listed(context: Context): List<Listed>? = runCatching {
+        val file = listingFile(context)
+        if (!file.isFile) return null
+        val entries = org.json.JSONArray(file.readText())
+        (0 until entries.length()).mapNotNull { i ->
+            entries.optJSONObject(i)?.takeIf { it.has("appid") }?.let { Listed(it.optLong("appid") and 0xFFFFFFFFL, it.optString("name"), it.optString("launch")) }
+        }
+    }.getOrNull()
+
     fun writeListing(context: Context, games: List<Game>,
         extra: List<JSONObject> = listOfNotNull(com.droiddeck.launcher.stores.epic.EpicClient.steamListing(context))): File {
-        val file = File(context.filesDir, "session/added-games.json").apply { parentFile?.mkdirs() }
+        val file = listingFile(context).apply { parentFile?.mkdirs() }
         val json = StringBuilder("[")
         games.forEachIndexed { i, g ->
             if (i > 0) json.append(',')
@@ -535,6 +596,7 @@ object AddedGames {
                 .append(",\"seen\":").append(SessionPrefs.addedGameExeSeen(context, g.folder.path))
             if (g.launchOptions.isNotEmpty()) json.append(",\"launch\":").append(quote(g.launchOptions))
             if (g.source != Library.ADDED) json.append(",\"store\":").append(quote(g.source))
+            if (!g.steamProgram) json.append(",\"route\":false")
             val art = AddedGameArt.resolve(context, g)
             val pieces = listOf("p" to art.portrait, "header" to art.header, "hero" to art.hero, "logo" to art.logo, "icon" to art.icon)
                 .mapNotNull { (k, f) -> f?.let { file -> artGuestPath(context, file)?.let { k to it } } }
@@ -545,9 +607,23 @@ object AddedGames {
             if (games.isNotEmpty() || i > 0) json.append(',')
             json.append(entry.toString())
         }
-        file.writeText(json.append(']').toString())
+        val text = json.append(']').toString()
+        synchronized(listing) {
+            val partial = File(file.parentFile, file.name + ".part")
+            try {
+                partial.writeText(text)
+                java.nio.file.Files.move(partial.toPath(), file.toPath(),
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+            } catch (e: java.io.IOException) {
+                Log.w(TAG, "games: listing not replaced: ${e.message}")
+                partial.delete()
+                if (!file.isFile) file.writeText(text)
+            }
+        }
         return file
     }
+
+    private val listing = Any()
 
     private fun artGuestPath(context: Context, file: File): String? {
         val files = context.filesDir.absolutePath

@@ -18,6 +18,14 @@ internal object XboxCatalog {
         "CFQ7TTC10QFD" to "Xbox Game Pass (Starter Edition)",
     )
 
+    /**
+     * The formats the installer can put on disk, so the catalogue never lists a
+     * title it cannot install. `MSIXVC` streams in place; an EAppx container is a
+     * legacy package that takes `legacy-install` instead.
+     */
+    internal fun installableFormat(format: String): Boolean =
+        format.equals("MSIXVC", true) || format.equals("EAPPX", true) || format.equals("EAPPXBUNDLE", true)
+
     fun access(json: JSONObject, account: String, market: String, now: Instant = Instant.now(), report: (String) -> Unit = {}): Map<String, String> {
         require(json.getInt("schema") == 1 && json.getString("account") == account && json.getString("market") == market)
         val age = java.time.Duration.between(timestamp(json.getString("checkedAt")), now).seconds
@@ -76,10 +84,42 @@ internal object XboxCatalog {
         return rawProducts(ids, market).mapNotNull { product(it, access) }
     }
 
-    fun rawProducts(ids: List<String>, market: String = Xodus.market()): List<JSONObject> {
-        return ids.map { it.uppercase() }.filter { productId.matches(it) }.distinct().chunked(25).flatMap { batch ->
+    fun launchArt(id: String, market: String = Xodus.market()): List<String> =
+        rawProducts(listOf(id.uppercase()), market).firstOrNull()?.let(::launchArtUrls).orEmpty()
+
+    internal fun launchArtUrls(json: JSONObject): List<String> {
+        val images = objects(objects(json.optJSONArray("LocalizedProperties")).firstOrNull()?.optJSONArray("Images"))
+        val order = listOf("SuperHeroArt", "TitledHeroArt", "Screenshot", "Hero")
+        return images.filter { it.optString("ImagePurpose") in order }
+            .sortedBy { order.indexOf(it.optString("ImagePurpose")) }
+            .mapNotNull { image ->
+                val raw = image.optString("Uri")
+                val url = if (raw.startsWith("//")) "https:$raw" else raw
+                runCatching { java.net.URI(url) }.getOrNull()?.takeIf {
+                    it.scheme == "https" && it.host in setOf("store-images.s-microsoft.com", "store-images.microsoft.com") && it.userInfo == null && it.port == -1
+                }?.toString()
+            }.distinct().take(12)
+    }
+
+    fun rawProducts(ids: List<String>, market: String = Xodus.market()): List<JSONObject> = productBatches(ids, market) { it }
+
+    // 25 ids per request, up to 4 requests at a time; each batch is mapped as it arrives (a whole library of raw entries is large).
+    fun <T> productBatches(ids: List<String>, market: String = Xodus.market(), map: (List<JSONObject>) -> List<T>): List<T> {
+        val batches = ids.map { it.uppercase() }.filter { productId.matches(it) }.distinct().chunked(25)
+        fun fetchBatch(batch: List<String>): List<T> {
             val body = get("https://displaycatalog.mp.microsoft.com/v7.0/products?bigIds=${batch.joinToString(",")}&market=$market&languages=en-us,neutral")
-            objects(body.optJSONArray("Products")).filter { it.optString("ProductId").uppercase() in batch }
+            return map(objects(body.optJSONArray("Products")).filter { it.optString("ProductId").uppercase() in batch })
+        }
+        if (batches.size <= 1) return batches.flatMap(::fetchBatch)
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(4)
+        try {
+            val tasks = batches.map { batch -> pool.submit(java.util.concurrent.Callable { fetchBatch(batch) }) }
+            return tasks.flatMap { task ->
+                try { task.get(60, java.util.concurrent.TimeUnit.SECONDS) }
+                catch (e: java.util.concurrent.ExecutionException) { throw e.cause ?: e }
+            }
+        } finally {
+            pool.shutdownNow()
         }
     }
 
@@ -102,11 +142,15 @@ internal object XboxCatalog {
         if (!productId.matches(id) || json.optString("ProductType") != "Game") return null
         val localized = objects(json.optJSONArray("LocalizedProperties")).firstOrNull() ?: return null
         val title = localized.optString("ProductTitle").takeIf { it.isNotBlank() } ?: return null
-        val packages = objects(json.optJSONArray("DisplaySkuAvailabilities")).flatMap {
-            objects(it.optJSONObject("Sku")?.optJSONObject("Properties")?.optJSONArray("Packages"))
-        }
+        val packages = objects(json.optJSONArray("DisplaySkuAvailabilities"))
+            .mapNotNull { it.optJSONObject("Sku")?.optJSONObject("Properties") }
+            .filter { it.opt("IsTrial") != true && it.opt("IsPreOrder") != true }
+            .flatMap { objects(it.optJSONArray("Packages")) }
         val pc = packages.filter { pkg -> objects(pkg.optJSONArray("PlatformDependencies")).any { it.optString("PlatformName") == "Windows.Desktop" } }
-        val installable = pc.any { it.optString("PackageFormat").equals("MSIXVC", true) }
+        val installable = pc.any { installableFormat(it.optString("PackageFormat")) }
+        // The installer needs the format, not just the fact that one exists: a
+        // legacy container takes a different subcommand from a streamed package.
+        val format = pc.firstOrNull { installableFormat(it.optString("PackageFormat")) }?.optString("PackageFormat").orEmpty()
         val streams = cloud?.streams(id, access[id].orEmpty()) == true
         if (!installable && !streams) return null
         val images = objects(localized.optJSONArray("Images"))
@@ -129,7 +173,8 @@ internal object XboxCatalog {
             publisher = localized.optString("PublisherName"), developer = localized.optString("DeveloperName"),
             description = localized.optString("ProductDescription"),
             sizeBytes = if (installable) pc.maxOfOrNull { it.optLong("MaxDownloadSizeInBytes") } ?: 0L else 0L,
-            extra = mapOf("market" to Xodus.market(), "access" to kind.orEmpty(), "pc" to flag(installable), "cloud" to flag(streams)),
+            extra = mapOf("market" to Xodus.market(), "access" to kind.orEmpty(), "pc" to flag(installable),
+                "cloud" to flag(streams), "format" to format),
         )
     }
 
@@ -167,16 +212,28 @@ val CatalogItem.xboxPc: Boolean get() = extra["pc"] != "0"
 val CatalogItem.xboxCloud: Boolean get() = extra["cloud"] == "1"
 val CatalogItem.xboxCloudId: String get() = extra["cloudId"]?.takeIf { it.isNotEmpty() } ?: id
 
+// One card per title: a cloud-only edition folds into the PC card (which then streams, and counts as owned when
+// the cloud edition is); cloud-only editions with the same title become one card, owned first.
 internal fun mergeEditions(games: List<CatalogItem>): List<CatalogItem> {
-    fun key(title: String) = title.lowercase().replace(Regex("[^a-z0-9]+"), "")
-    val cloudOnly = games.filter { !it.xboxPc && it.xboxCloud }.groupBy { key(it.title) }
-    val folded = HashSet<String>()
-    val merged = games.map { game ->
-        if (!game.xboxPc || game.xboxCloud) game
-        else cloudOnly[key(game.title)]?.firstOrNull()?.let { console ->
-            folded.add(console.id)
-            game.copy(extra = game.extra + mapOf("cloud" to "1", "cloudId" to console.id))
-        } ?: game
+    fun key(title: String): String {
+        val lower = title.lowercase()
+        val letters = StringBuilder().apply { lower.codePoints().filter { Character.isLetterOrDigit(it) }.forEach { appendCodePoint(it) } }
+        return letters.toString().ifEmpty { lower.trim() }
     }
-    return merged.filter { it.id !in folded }
+    val pcKeys = games.filter { it.xboxPc }.map { key(it.title) }.toSet()
+    val cloudOnly = games.filter { !it.xboxPc && it.xboxCloud }.groupBy { key(it.title) }
+        .mapValues { (_, list) -> list.sortedByDescending { it.owned }.first() }
+    return games.mapNotNull { game ->
+        val console = cloudOnly[key(game.title)]
+        when {
+            !game.xboxPc -> game.takeIf { key(game.title) !in pcKeys && (console == null || console === game) }
+            console == null -> game
+            else -> {
+                val cloudId = if (game.xboxCloud) game.extra["cloudId"].orEmpty() else console.id
+                val merged = game.copy(extra = game.extra + mapOf("cloud" to "1", "cloudId" to cloudId))
+                if (console.owned && !game.owned) merged.copy(owned = true, subscription = false, extra = merged.extra + ("access" to "owned"))
+                else merged
+            }
+        }
+    }
 }
